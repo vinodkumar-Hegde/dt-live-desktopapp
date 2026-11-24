@@ -6,7 +6,7 @@ namespace DTLocalStudio;
 public partial class MainWindow : Window
 {
     private Process? preview;
-    private readonly DispatcherTimer scanTimer = new() { Interval=TimeSpan.FromSeconds(3) };
+    private readonly DispatcherTimer scanTimer = new() { Interval=TimeSpan.FromSeconds(5) };
     private bool scanning;
     private sealed record Source(int Pid, long Handle, string Label, int Score);
     private long lastAutoHandle;
@@ -21,7 +21,9 @@ public partial class MainWindow : Window
     }
     private async void ScanClick(object sender, RoutedEventArgs e)
     {
-        if(scanning) return; scanning=true;
+        if(scanning || closing) return;
+        if(sender is not System.Windows.Controls.Button && preview!=null && !preview.HasExited) return;
+        scanning=true;
         if (sender is System.Windows.Controls.Button button) button.IsEnabled = false;
         try {
             var info = new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute=false, CreateNoWindow=true };
@@ -38,9 +40,11 @@ public partial class MainWindow : Window
             if(closing) return;
             var selected=Sources.SelectedItem as Source;
             items=items.OrderByDescending(x=>x.Score).ToList();
-            Sources.ItemsSource=items;
-            var match=selected==null?-1:items.FindIndex(x=>x.Pid==selected.Pid && x.Handle==selected.Handle);
-            Sources.SelectedIndex=match>=0?match:items.Count>0?0:-1;
+            if(Sources.ItemsSource is not List<Source> previous || !previous.SequenceEqual(items)){
+                Sources.ItemsSource=items;
+                var match=selected==null?-1:items.FindIndex(x=>x.Pid==selected.Pid && x.Handle==selected.Handle);
+                Sources.SelectedIndex=match>=0?match:items.Count>0?0:-1;
+            }
             Status.Text = items.Count == 0 ? "No Zoom main window found. Restore Zoom and scan again." : $"Found {items.Count} Zoom main window(s). Select the meeting window.";
             if(sender is System.Windows.Controls.Button) App.Log($"ZOOM_SCAN count={items.Count}");
             if(items.All(x=>x.Handle!=lastAutoHandle)) lastAutoHandle=0;

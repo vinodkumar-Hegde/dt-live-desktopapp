@@ -17,7 +17,7 @@ internal sealed class CaptureWindow : Window
 {
     private readonly IntPtr source;
     private readonly int pid, parentPid;
-    private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromMilliseconds(66) };
+    private readonly DispatcherTimer timer = new(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(66) };
     private readonly Image frame = new() { Stretch = Stretch.Uniform };
     private readonly Image presentation = new() { Stretch = Stretch.Uniform };
     private readonly Image faculty = new() { Stretch = Stretch.Uniform };
@@ -64,6 +64,9 @@ internal sealed class CaptureWindow : Window
     private long lastAudio;
     private volatile string? audioError;
     private bool busy, closed, running, frozen;
+    private long lastTelemetry;
+    private (Rect? P,Rect? F,bool Selecting,int Active,double W,double H,int BW,int BH)? overlayKey;
+    private bool showRegionPreviews=true;
     private Point? dragStart;
     private Rect? screenCrop, facultyCrop;
     private byte[]? lastSample;
@@ -73,15 +76,17 @@ internal sealed class CaptureWindow : Window
     public CaptureWindow(long hwnd, int sourcePid, int parent,bool automatic=false)
     {
         source = new IntPtr(hwnd); pid = sourcePid; parentPid = parent; autoLaunch=automatic;
-        Title = "DT Local Studio — Recording Studio 0.6.2";
+        Title = "DT Local Studio — Recording Studio 0.6.3";
         Width = 1320; Height = 880; MinWidth = 900; MinHeight = 680;
         Background = new SolidColorBrush(Color.FromRgb(244,247,251));
-        var root = new DockPanel { Margin = new Thickness(18) };
+        UseLayoutRounding=true; SnapsToDevicePixels=true; FontFamily=new FontFamily("Segoe UI"); FontSize=13;
+        var root = new DockPanel { Margin = new Thickness(22) };
         var top = new StackPanel();
         var header = new StackPanel { Orientation=Orientation.Horizontal };
         header.Children.Add(new Image { Source=new BitmapImage(new Uri("pack://application:,,,/Assets/doctutorials_logo.png")), Width=100, Height=73, Margin=new Thickness(0,0,18,0) });
         header.Children.Add(new TextBlock { Text="Recording Studio", FontSize=28, Foreground=Brushes.DarkSlateGray, VerticalAlignment=VerticalAlignment.Center });
         top.Children.Add(header);
+        top.Children.Add(new TextBlock { Text="LOCAL RECORDING  /  ZOOM CAPTURE", Foreground=Brushes.SlateGray, FontSize=11, Margin=new Thickness(0,4,0,6) });
         top.Children.Add(new TextBlock { Text = "Authorized sessions only. Keep Zoom restored. Automatic mode searches for a large presentation and a smaller moving video pane; system audio is not Zoom-only. Visible-screen mode includes overlapping windows.", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0,6,0,8) });
         var controls = new WrapPanel();
         mode.Items.Add("Window render (experimental)"); mode.Items.Add("Visible screen pixels"); mode.SelectedIndex = 0;
@@ -100,7 +105,7 @@ internal sealed class CaptureWindow : Window
         AddButton(controls,"Restore saved layout", RestoreLayout);
         AddButton(controls,"Start audio meter", StartAudio);
         AddButton(controls,"Stop audio", StopAudio);
-        top.Children.Add(controls);
+        var advanced = new Expander { Header="Capture setup and region adjustment", IsExpanded=false, Content=controls, Margin=new Thickness(0,6,0,6) };
         var storage = new WrapPanel { Margin = new Thickness(0,4,0,4) };
         storage.Children.Add(new TextBlock { Text="Output folder: ", VerticalAlignment=VerticalAlignment.Center }); storage.Children.Add(outputFolder);
         AddButton(storage,"Browse folder", () => { var d=new Microsoft.Win32.OpenFolderDialog { Title="Choose recording folder" }; if(d.ShowDialog(this)==true) outputFolder.Text=d.FolderName; });
@@ -108,7 +113,7 @@ internal sealed class CaptureWindow : Window
         storage.Children.Add(new TextBlock { Text="FFmpeg: ", VerticalAlignment=VerticalAlignment.Center }); storage.Children.Add(ffmpegPath);
         AddButton(storage,"Choose FFmpeg", async () => { var d=new Microsoft.Win32.OpenFileDialog { Filter="FFmpeg executable|ffmpeg.exe|Executables|*.exe" }; if(d.ShowDialog(this)==true) { ffmpegPath.Text=d.FileName; await CheckEncoder(); } });
         AddButton(storage,"Detect FFmpeg", async () => await CheckEncoder());
-        top.Children.Add(storage);
+        var storageSettings = new Expander { Header="Recording location and encoder settings", IsExpanded=false, Content=storage, Margin=new Thickness(0,0,0,6) };
         var recordControls = new WrapPanel();
         AddButton(recordControls,"Start recording", StartRecord);
         AddButton(recordControls,"Pause recording", () => { recording?.Pause(); });
@@ -117,20 +122,24 @@ internal sealed class CaptureWindow : Window
         recordControls.Children.Add(autoRecord);
         autoRecord.Checked += (_,_) => { activeSince=0; StartAudio(); automationInfo.Text="Automatic recording armed. Waiting for a stable detected or manually confirmed layout."; };
         autoRecord.Unchecked += (_,_) => { activeSince=0; automationInfo.Text="Automatic start disarmed."; };
-        top.Children.Add(recordControls); top.Children.Add(recordingStatus); top.Children.Add(automationInfo);
+        var actionsCard=new Border { Background=Brushes.White, BorderBrush=(Brush)FindResource("LineBrush"), BorderThickness=new Thickness(1), CornerRadius=new CornerRadius(10), Padding=new Thickness(10), Margin=new Thickness(0,6,0,8), Child=recordControls };
+        top.Children.Add(actionsCard); top.Children.Add(recordingStatus); top.Children.Add(automationInfo);
+        top.Children.Add(advanced); top.Children.Add(storageSettings);
         var audioRow = new WrapPanel { Margin = new Thickness(0,8,0,8) };
-        audioRow.Children.Add(audioText); audioRow.Children.Add(meter); top.Children.Add(audioRow);
+        audioRow.Children.Add(audioText); meter.Margin=new Thickness(12,0,8,0); audioRow.Children.Add(meter);
+        var previewToggle=new CheckBox { Content="Show region previews", IsChecked=true, Margin=new Thickness(12,0,0,0) };
+        previewToggle.Checked+=(_,_)=>{showRegionPreviews=true;}; previewToggle.Unchecked+=(_,_)=>{showRegionPreviews=false;presentation.Source=faculty.Source=null;}; audioRow.Children.Add(previewToggle); top.Children.Add(audioRow);
         top.Children.Add(status); top.Children.Add(selectionInfo);
         DockPanel.SetDock(top,Dock.Top); root.Children.Add(top);
-        var grid = new Grid();
+        var grid = new Grid { Margin=new Thickness(0,8,0,0) };
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(2,GridUnitType.Star) });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1,GridUnitType.Star) });
         var left = new DockPanel { Margin = new Thickness(0,0,8,0) };
         var label = new TextBlock { Text = "Source — blue: presentation | green: faculty", Margin = new Thickness(0,8,0,8) };
         DockPanel.SetDock(label,Dock.Top); left.Children.Add(label);
-        var sourceGrid = new Grid { ClipToBounds = true, Background = Brushes.Black };
+        var sourceGrid = new Grid { ClipToBounds = true, Background = (Brush)FindResource("PreviewBrush") };
         sourceGrid.Children.Add(frame); sourceGrid.Children.Add(overlay);
-        left.Children.Add(sourceGrid);
+        left.Children.Add(new Border { CornerRadius=new CornerRadius(8), BorderThickness=new Thickness(1), BorderBrush=(Brush)FindResource("LineBrush"), Child=sourceGrid });
         overlay.SizeChanged += (_,_) => DrawBoxes();
         grid.Children.Add(left);
         var right = new Grid();
@@ -252,9 +261,12 @@ internal sealed class CaptureWindow : Window
     }
     private void DrawBoxes()
     {
+        if(frame.Source is not BitmapSource b || overlay.ActualWidth<=0 || overlay.ActualHeight<=0) {overlay.Children.Clear();overlayKey=null;return;}
+        var key=(screenCrop,facultyCrop,selecting,activeRegion,overlay.ActualWidth,overlay.ActualHeight,b.PixelWidth,b.PixelHeight);
+        if(overlayKey==key)return;
+        overlayKey=key;
         overlay.Children.Clear();
         selectionInfo.Text=$"Presentation: {(screenCrop.HasValue?"selected":"not selected")} | Faculty: {(facultyCrop.HasValue?"selected":"not selected")} | {(selecting?(activeRegion==0?"Editing presentation":"Editing faculty"):"Live / not editing")}";
-        if(frame.Source is not BitmapSource b || overlay.ActualWidth<=0 || overlay.ActualHeight<=0) return;
         DrawBox(screenCrop, Brushes.DodgerBlue,"Presentation",0,b);
         DrawBox(facultyCrop, Brushes.LimeGreen,"Faculty",1,b);
     }
@@ -275,13 +287,15 @@ internal sealed class CaptureWindow : Window
     private static DockPanel PanelFor(string name, Image image)
     {
         var panel = new DockPanel { Margin = new Thickness(0,4,0,4) };
-        var text = new TextBlock { Text = name, Margin = new Thickness(0,4,0,4) };
+        var text = new TextBlock { Text = name, FontWeight=FontWeights.SemiBold, Foreground=Brushes.DarkSlateGray, Margin = new Thickness(0,4,0,8) };
         DockPanel.SetDock(text,Dock.Top); panel.Children.Add(text);
-        panel.Children.Add(new Border { Background = Brushes.WhiteSmoke, Child = image }); return panel;
+        panel.Children.Add(new Border { Background = Brushes.White, BorderBrush=Brushes.LightSlateGray, BorderThickness=new Thickness(1), CornerRadius=new CornerRadius(6), Child = image }); return panel;
     }
     private void AddButton(Panel panel,string title,Action action)
     {
-        var b = new Button { Content = title, Padding = new Thickness(9,5,9,5), Margin = new Thickness(3) };
+        var b = new Button { Content = title, Margin = new Thickness(4), MinHeight=36 };
+        if(title=="Start recording")b.Style=(Style)FindResource("PrimaryButton");
+        else if(title=="Stop and save MP4")b.Style=(Style)FindResource("DangerButton");
         b.Click += (_,_) => {
             if (finishing) return;
             if (recording!=null && title is not ("Pause recording" or "Resume recording" or "Stop and save MP4" or "Open folder")) { recordingStatus.Text="Stop recording before changing capture or storage settings."; return; }
@@ -299,7 +313,7 @@ internal sealed class CaptureWindow : Window
     }
     private void UpdateRegions(BitmapSource b)
     {
-        presentation.Source = Crop(b,screenCrop); faculty.Source = Crop(b,facultyCrop);
+        if(showRegionPreviews){presentation.Source = Crop(b,screenCrop); faculty.Source = Crop(b,facultyCrop);}
     }
     private static BitmapSource? Crop(BitmapSource b, Rect? region)
     {
@@ -319,10 +333,14 @@ internal sealed class CaptureWindow : Window
         }
         var level = Stopwatch.GetElapsedTime(Interlocked.Read(ref lastAudio)).TotalSeconds < 0.7 ? Volatile.Read(ref rms) : 0;
         double db = 20*Math.Log10(Math.Max(level,0.000001));
-        meter.Value = Math.Clamp((db+60)*100/60,0,100);
-        if (audio != null) audioText.Text = audioError ?? $"System output (not Zoom-only): {db:F1} dBFS | {(db > -45 ? "active" : "quiet")} ";
+        bool telemetryDue=Stopwatch.GetElapsedTime(lastTelemetry,now).TotalMilliseconds>=250;
+        if(telemetryDue){
+            lastTelemetry=now;
+            meter.Value=Math.Clamp((db+60)*100/60,0,100);
+            if(audio!=null)audioText.Text=audioError??$"System output (not Zoom-only): {db:F1} dBFS | {(db > -45 ? "active" : "quiet")} ";
+        }
         if (recording is RecordingSession rec) {
-            recordingStatus.Text=rec.Status;
+            if(telemetryDue)recordingStatus.Text=rec.Status;
             if(rec.Failure!=null || audioError!=null) { await FinishRecord(); return; }
         }
         if (recording!=null && lastGoodFrame!=0 && Stopwatch.GetElapsedTime(lastGoodFrame).TotalSeconds>5) {
@@ -360,8 +378,7 @@ internal sealed class CaptureWindow : Window
             }
             if(autoRecord.IsChecked==true && recording==null && !finishing) {
                 string wait=encoderChecking?"Checking FFmpeg encoder":resolvedEncoder==null?(encoderFailure??"Waiting for FFmpeg validation"):!confirmedLayout?"Detecting faculty/presentation panes (manual selection available)":result.Dark?"Waiting for nonblank frames":mode.SelectedIndex!=0?"Automatic recording requires window-render mode":audio==null||audioError!=null?"Waiting for audio device":"Ready — checking stable live frames";
-                automationInfo.Text=wait;
-                if(lastWait!=wait){lastWait=wait; App.Log("AUTO_STATE "+wait);}
+                if(lastWait!=wait){automationInfo.Text=wait;lastWait=wait; App.Log("AUTO_STATE "+wait);}
             }
             if(autoRecord.IsChecked==true && recording==null && !finishing && resolvedEncoder!=null && !encoderChecking && confirmedLayout && !result.Dark && mode.SelectedIndex==0 && audio!=null && audioError==null) {
                 if(activeSince==0) activeSince=Stopwatch.GetTimestamp();
@@ -374,7 +391,7 @@ internal sealed class CaptureWindow : Window
             if (lastSample != null) for(int i=0;i<result.Sample.Length;i++) if (Math.Abs(result.Sample[i]-lastSample[i])>12) changed++;
             double motion = 100.0*changed/result.Sample.Length;
             lastSample = result.Sample; frames++;
-            status.Text = $"Capture: {measuredFps:F1} FPS | Frames: {frames} | {result.Bitmap.PixelWidth} × {result.Bitmap.PixelHeight} | motion {motion:F1}% | {(result.Dark ? "Dark/blank candidate — try alternate mode" : "Frame received")} | {clock.Elapsed:hh\\:mm\\:ss}";
+            if(telemetryDue) status.Text = $"Capture: {measuredFps:F1} FPS | Frames: {frames} | {result.Bitmap.PixelWidth} × {result.Bitmap.PixelHeight} | motion {motion:F1}% | {(result.Dark ? "Dark/blank candidate — try alternate mode" : "Frame received")} | {clock.Elapsed:hh\\:mm\\:ss}";
             if (frames==1 || frames%50==0) App.Log($"FRAME_RECEIVED count={frames} dark={result.Dark} motion={motion:F1}");
         } catch(Exception ex) { running=false; status.Text=$"Capture stopped: {ex.Message}. Restore Zoom or rescan."; App.Log($"CAPTURE_ERROR {ex}"); autoRecord.IsChecked=false; if(recording!=null) await FinishRecord(); }
         finally { busy=false; }
@@ -457,7 +474,7 @@ internal sealed class CaptureWindow : Window
         finishing=true;
         recordingStatus.Text="Finalizing MP4 — do not close the app.";
         try {
-            var path=await session.FinishAsync();
+            var path=await Task.Run(()=>session.FinishAsync());
             recordingStatus.Text="Saved: "+path;
             App.Log("RECORD_SAVED "+path);
         } catch(Exception ex) { recordingStatus.Text="Recording finalization failed: "+ex.Message+" | Recovery: "+session.WorkFolder; App.Log($"RECORD_ERROR {ex}"); }
