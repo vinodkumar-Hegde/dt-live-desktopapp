@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Text.Json;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
@@ -16,7 +17,7 @@ internal sealed class CaptureWindow : Window
 {
     private readonly IntPtr source;
     private readonly int pid, parentPid;
-    private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromMilliseconds(200) };
+    private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromMilliseconds(66) };
     private readonly Image frame = new() { Stretch = Stretch.Uniform };
     private readonly Image presentation = new() { Stretch = Stretch.Uniform };
     private readonly Image faculty = new() { Stretch = Stretch.Uniform };
@@ -34,6 +35,17 @@ internal sealed class CaptureWindow : Window
     private WasapiLoopbackCapture? audio;
     private RecordingSession? recording;
     private bool finishing, allowClose;
+    private readonly CheckBox autoRecord = new() { Content="Arm automatic recording", Margin=new Thickness(6), VerticalAlignment=VerticalAlignment.Center };
+    private readonly TextBlock automationInfo = new() { Foreground=Brushes.SteelBlue, TextWrapping=TextWrapping.Wrap };
+    private bool confirmedLayout;
+    private int layoutWidth,layoutHeight;
+    private long activeSince,lastGoodFrame,lastUiUpdate,lastParentCheck;
+    private bool lastDark=true;
+    private readonly Stopwatch captureRate=Stopwatch.StartNew();
+    private int rateFrames;
+    private double measuredFps;
+    private string ProfilePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"DTLocalStudio","layout.json");
+    private sealed record LayoutProfile(int Width,int Height,double[] Presentation,double[] Faculty);
     private readonly TextBlock recordingStatus = new() { TextWrapping = TextWrapping.Wrap, Foreground = Brushes.DarkRed };
     private readonly TextBox outputFolder = new() { Width = 380, Text = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos),"DTLocalStudio") };
     private readonly TextBox ffmpegPath = new() { Width = 220, Text = "ffmpeg.exe" };
@@ -50,13 +62,13 @@ internal sealed class CaptureWindow : Window
     public CaptureWindow(long hwnd, int sourcePid, int parent)
     {
         source = new IntPtr(hwnd); pid = sourcePid; parentPid = parent;
-        Title = "DT Local Studio — Capture lab 0.4.0";
-        Width = 1200; Height = 800; MinWidth = 700; MinHeight = 540;
-        Background = Brushes.White;
+        Title = "DT Local Studio — Recording Studio 0.5.0";
+        Width = 1320; Height = 880; MinWidth = 900; MinHeight = 680;
+        Background = new SolidColorBrush(Color.FromRgb(244,247,251));
         var root = new DockPanel { Margin = new Thickness(18) };
         var top = new StackPanel();
-        top.Children.Add(new TextBlock { Text = "Capture lab", FontSize = 24 });
-        top.Children.Add(new TextBlock { Text = "Window capture is experimental. Visible-screen mode captures anything covering Zoom; keep the lab on another monitor or beside Zoom. Record only authorized sessions. System audio includes other applications.", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0,6,0,8) });
+        top.Children.Add(new TextBlock { Text = "Recording Studio", FontSize = 28, Foreground = Brushes.DarkSlateGray });
+        top.Children.Add(new TextBlock { Text = "Authorized sessions only. Keep Zoom restored. Automatic mode requires a confirmed layout and uses system audio (not Zoom-only). Visible-screen mode includes overlapping windows.", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0,6,0,8) });
         var controls = new WrapPanel();
         mode.Items.Add("Window render (experimental)"); mode.Items.Add("Visible screen pixels"); mode.SelectedIndex = 0;
         
@@ -65,13 +77,14 @@ internal sealed class CaptureWindow : Window
         AddButton(controls,"Stop frames", () => { CancelDrag(); selecting = false; running = false; frozen = false; DrawBoxes(); });
         AddButton(controls,"Select presentation", () => BeginSelection(0));
         AddButton(controls,"Select faculty", () => BeginSelection(1));
-        AddButton(controls,"Done / live", () => { CancelDrag(); selecting = false; frozen = false; running = true; DrawBoxes(); });
-        AddButton(controls,"Reset regions", () => { CancelDrag(); screenCrop = facultyCrop = null; presentation.Source = faculty.Source = null; DrawBoxes(); });
-        AddButton(controls,"Layout preset", () => {
+        AddButton(controls,"Confirm layout / live", ConfirmLayout);
+        AddButton(controls,"Reset regions", () => { CancelDrag(); confirmedLayout=false; screenCrop = facultyCrop = null; presentation.Source = faculty.Source = null; DrawBoxes(); });
+        AddButton(controls,"Suggest layout", () => {
             if (frame.Source is not BitmapSource b) { status.Text = "Start frames first."; return; }
             screenCrop = new Rect(0.02,0.05,0.72,0.90); facultyCrop = new Rect(0.76,0.65,0.22,0.30);
-            UpdateRegions(b); DrawBoxes(); BeginSelection(0);
+            confirmedLayout=false; UpdateRegions(b); DrawBoxes(); BeginSelection(0);
         });
+        AddButton(controls,"Restore saved layout", RestoreLayout);
         AddButton(controls,"Start audio meter", StartAudio);
         AddButton(controls,"Stop audio", StopAudio);
         top.Children.Add(controls);
@@ -86,8 +99,11 @@ internal sealed class CaptureWindow : Window
         AddButton(recordControls,"Start recording", StartRecord);
         AddButton(recordControls,"Pause recording", () => { recording?.Pause(); });
         AddButton(recordControls,"Resume recording", () => { recording?.Resume(); });
-        AddButton(recordControls,"Stop and save MP4", async () => await FinishRecord());
-        top.Children.Add(recordControls); top.Children.Add(recordingStatus);
+        AddButton(recordControls,"Stop and save MP4", async () => { autoRecord.IsChecked=false; await FinishRecord(); });
+        recordControls.Children.Add(autoRecord);
+        autoRecord.Checked += (_,_) => { activeSince=0; StartAudio(); automationInfo.Text="Armed: confirm both regions. Starts after sustained audio and valid frames."; };
+        autoRecord.Unchecked += (_,_) => { activeSince=0; automationInfo.Text="Automatic start disarmed."; };
+        top.Children.Add(recordControls); top.Children.Add(recordingStatus); top.Children.Add(automationInfo);
         var audioRow = new WrapPanel { Margin = new Thickness(0,8,0,8) };
         audioRow.Children.Add(audioText); audioRow.Children.Add(meter); top.Children.Add(audioRow);
         top.Children.Add(status); top.Children.Add(selectionInfo);
@@ -145,7 +161,7 @@ internal sealed class CaptureWindow : Window
         };
         overlay.LostMouseCapture += (_,_) => { dragStart=null; originalDrag=null; };
         timer.Tick += Tick;
-        ContentRendered += (_,_) => { timer.Start(); App.Log("CAPTURE_LAB_READY"); };
+        ContentRendered += (_,_) => { running=true; timer.Start(); App.Log("CAPTURE_LAB_READY"); };
         Closing += async (_, e) => {
             if (allowClose || (recording==null && !finishing)) return;
             e.Cancel=true;
@@ -153,6 +169,47 @@ internal sealed class CaptureWindow : Window
             await FinishRecord(); allowClose=true; Close();
         };
         Closed += (_,_) => { closed = true; timer.Stop(); StopAudio(); App.Log("CAPTURE_LAB_CLOSED"); };
+    }
+    private void ConfirmLayout()
+    {
+        if(frame.Source is not BitmapSource b || screenCrop is not Rect p || facultyCrop is not Rect f || Rect.Intersect(p,f).Width>0 && Rect.Intersect(p,f).Height>0) { status.Text="Select two separate, non-overlapping regions first."; return; }
+        CancelDrag(); selecting=false; frozen=false; running=true; confirmedLayout=true;
+        layoutWidth=b.PixelWidth; layoutHeight=b.PixelHeight;
+        try {
+            Directory.CreateDirectory(Path.GetDirectoryName(ProfilePath)!);
+            File.WriteAllText(ProfilePath,JsonSerializer.Serialize(new LayoutProfile(layoutWidth,layoutHeight,[p.X,p.Y,p.Width,p.Height],[f.X,f.Y,f.Width,f.Height])));
+            App.Log("LAYOUT_CONFIRMED");
+        } catch(Exception ex) { App.Log("LAYOUT_SAVE_ERROR "+ex.Message); }
+        DrawBoxes();
+    }
+    private void RestoreLayout()
+    {
+        if(frame.Source is not BitmapSource b) { status.Text="Wait for live frames."; return; }
+        try {
+            var profile=JsonSerializer.Deserialize<LayoutProfile>(File.ReadAllText(ProfilePath))??throw new InvalidOperationException("No layout.");
+            if(profile.Width!=b.PixelWidth || profile.Height!=b.PixelHeight) throw new InvalidOperationException("Source dimensions changed; select regions again.");
+            static Rect Decode(double[] a) {
+                if(a.Length!=4 || a.Any(x=>!double.IsFinite(x)) || a[0]<0 || a[1]<0 || a[2]<MinRegion || a[3]<MinRegion || a[0]+a[2]>1.000001 || a[1]+a[3]>1.000001) throw new InvalidDataException("Invalid region.");
+                return new Rect(a[0],a[1],a[2],a[3]);
+            }
+            screenCrop=Decode(profile.Presentation); facultyCrop=Decode(profile.Faculty);
+            confirmedLayout=false; UpdateRegions(b); DrawBoxes();
+            status.Text="Saved layout restored. Verify content and confirm before recording.";
+        } catch(Exception ex) { status.Text="Layout unavailable: "+ex.Message; }
+    }
+    private void SuggestRegions(BitmapSource b)
+    {
+        // Layout heuristic only: a shared presentation is normally the largest pane.
+        // Never label an unverified crop as a detected person.
+        if(b.PixelWidth/(double)b.PixelHeight>=1.4) {
+            screenCrop=new Rect(.015,.07,.745,.86);
+            facultyCrop=new Rect(.775,.60,.21,.32);
+        } else {
+            screenCrop=new Rect(.03,.06,.94,.64);
+            facultyCrop=new Rect(.58,.73,.38,.22);
+        }
+        confirmedLayout=false;
+        automationInfo.Text="Suggested regions (not identity detection). Adjust and confirm once.";
     }
     private void CancelDrag()
     {
@@ -162,11 +219,11 @@ internal sealed class CaptureWindow : Window
     private void BeginSelection(int type)
     {
         if(frame.Source is not BitmapSource b) { status.Text="Start frames first, then choose a region."; return; }
-        CancelDrag(); activeRegion=type; selecting=true; frozen=true;
+        CancelDrag(); confirmedLayout=false; activeRegion=type; selecting=true; frozen=true;
         if(type==0 && screenCrop==null) screenCrop=new Rect(0.03,0.05,0.72,0.90);
         if(type==1 && facultyCrop==null) facultyCrop=new Rect(0.76,0.65,0.22,0.30);
         UpdateRegions(b); DrawBoxes();
-        status.Text="Editing "+(type==0?"presentation":"faculty")+". Drag inside to move; drag bottom-right handle to resize; drag outside to redraw. Click Done / live when finished.";
+        status.Text="Editing "+(type==0?"presentation":"faculty")+". Drag inside to move; drag bottom-right handle to resize; drag outside to redraw. Click Confirm layout / live when finished.";
     }
     private Rect DisplayRect(Rect r, BitmapSource b)
     {
@@ -235,8 +292,12 @@ internal sealed class CaptureWindow : Window
     private async void Tick(object? sender,EventArgs e)
     {
         if (closed) return;
-        try { using var parent = Process.GetProcessById(parentPid); if (parent.HasExited) { Close(); return; } }
-        catch { Close(); return; }
+        long now=Stopwatch.GetTimestamp();
+        if(Stopwatch.GetElapsedTime(lastParentCheck,now).TotalSeconds>=1) {
+            lastParentCheck=now;
+            try { using var parent = Process.GetProcessById(parentPid); if (parent.HasExited) { Close(); return; } }
+            catch { Close(); return; }
+        }
         var level = Stopwatch.GetElapsedTime(Interlocked.Read(ref lastAudio)).TotalSeconds < 0.7 ? Volatile.Read(ref rms) : 0;
         double db = 20*Math.Log10(Math.Max(level,0.000001));
         meter.Value = Math.Clamp((db+60)*100/60,0,100);
@@ -245,22 +306,51 @@ internal sealed class CaptureWindow : Window
             recordingStatus.Text=rec.Status;
             if(rec.Failure!=null || audioError!=null) { await FinishRecord(); return; }
         }
+        if (recording!=null && lastGoodFrame!=0 && Stopwatch.GetElapsedTime(lastGoodFrame).TotalSeconds>5) {
+            autoRecord.IsChecked=false; automationInfo.Text="Capture stalled: finalizing recording."; await FinishRecord(); return;
+        }
         if (!running || frozen || busy) return;
         busy = true;
         try {
             bool visible = mode.SelectedIndex == 1;
+            var currentRecording=recording;
+            var p=screenCrop; var f=facultyCrop;
             var result = await Task.Run(() => ReadFrame(visible));
             if (closed || !running || frozen) return;
-            frame.Source = result.Bitmap; UpdateRegions(result.Bitmap); DrawBoxes();
-            if (recording is RecordingSession current && !current.IsPaused)
-                current.SetFrame(Compose(result.Bitmap,screenCrop!.Value,facultyCrop!.Value));
+            lastDark=result.Dark;
+            if(!result.Dark) lastGoodFrame=Stopwatch.GetTimestamp();
+            if(confirmedLayout && (layoutWidth!=result.Bitmap.PixelWidth || layoutHeight!=result.Bitmap.PixelHeight)) {
+                confirmedLayout=false; autoRecord.IsChecked=false;
+                if(recording!=null) await FinishRecord();
+                status.Text="Zoom layout size changed. Confirm regions again.";
+            }
+            if(screenCrop==null && facultyCrop==null && !result.Dark) {
+                frame.Source=result.Bitmap;
+                if(File.Exists(ProfilePath)) RestoreLayout();
+                if(screenCrop==null || facultyCrop==null) SuggestRegions(result.Bitmap);
+            }
+            if (currentRecording!=null && ReferenceEquals(recording,currentRecording) && !currentRecording.IsPaused && !result.Dark && p is Rect pr && f is Rect fr)
+                currentRecording.SetFrame(await Task.Run(()=>ComposePixels(result.Bitmap,pr,fr)));
+            if(closed || !running || frozen) return;
+            rateFrames++;
+            if(captureRate.Elapsed.TotalSeconds>=1) { measuredFps=rateFrames/captureRate.Elapsed.TotalSeconds; rateFrames=0; captureRate.Restart(); }
+            if(Stopwatch.GetElapsedTime(lastUiUpdate).TotalMilliseconds>=200) {
+                lastUiUpdate=Stopwatch.GetTimestamp(); frame.Source=result.Bitmap; UpdateRegions(result.Bitmap); DrawBoxes();
+            }
+            if(autoRecord.IsChecked==true && recording==null && !finishing && confirmedLayout && !result.Dark && mode.SelectedIndex==0 && audio!=null && audioError==null && db> -40) {
+                if(activeSince==0) activeSince=Stopwatch.GetTimestamp();
+                if(Stopwatch.GetElapsedTime(activeSince).TotalSeconds>=3) {
+                    activeSince=0; StartRecord();
+                    if(recording==null) autoRecord.IsChecked=false;
+                }
+            } else activeSince=0;
             int changed=0;
             if (lastSample != null) for(int i=0;i<result.Sample.Length;i++) if (Math.Abs(result.Sample[i]-lastSample[i])>12) changed++;
             double motion = 100.0*changed/result.Sample.Length;
             lastSample = result.Sample; frames++;
-            status.Text = $"Frames: {frames} | {result.Bitmap.PixelWidth} × {result.Bitmap.PixelHeight} | motion {motion:F1}% | {(result.Dark ? "Dark/blank candidate — try alternate mode" : "Frame received")} | {clock.Elapsed:hh\\:mm\\:ss}";
+            status.Text = $"Capture: {measuredFps:F1} FPS | Frames: {frames} | {result.Bitmap.PixelWidth} × {result.Bitmap.PixelHeight} | motion {motion:F1}% | {(result.Dark ? "Dark/blank candidate — try alternate mode" : "Frame received")} | {clock.Elapsed:hh\\:mm\\:ss}";
             if (frames==1 || frames%50==0) App.Log($"FRAME_RECEIVED count={frames} dark={result.Dark} motion={motion:F1}");
-        } catch(Exception ex) { running=false; status.Text=$"Capture stopped: {ex.Message}. Restore Zoom or rescan."; App.Log($"CAPTURE_ERROR {ex}"); if(recording!=null) await FinishRecord(); }
+        } catch(Exception ex) { running=false; status.Text=$"Capture stopped: {ex.Message}. Restore Zoom or rescan."; App.Log($"CAPTURE_ERROR {ex}"); autoRecord.IsChecked=false; if(recording!=null) await FinishRecord(); }
         finally { busy=false; }
     }
     private sealed record FrameResult(BitmapSource Bitmap,byte[] Sample,bool Dark);
@@ -299,13 +389,13 @@ internal sealed class CaptureWindow : Window
     private void StartRecord()
     {
         if(recording!=null || finishing) return;
-        if(frame.Source is not BitmapSource b || screenCrop is not Rect p || facultyCrop is not Rect f || !running || frozen) { recordingStatus.Text="Start frames, select both regions and click Done / live first."; return; }
+        if(frame.Source is not BitmapSource b || screenCrop is not Rect p || facultyCrop is not Rect f || !running || frozen || !confirmedLayout || lastDark || lastGoodFrame==0 || Stopwatch.GetElapsedTime(lastGoodFrame).TotalSeconds>2) { recordingStatus.Text="Wait for valid live frames and confirm both regions first."; return; }
         try {
             if(!System.IO.Path.IsPathFullyQualified(outputFolder.Text)) throw new InvalidOperationException("Choose an absolute output folder.");
             if(mode.SelectedIndex==1 && MessageBox.Show("Visible-screen mode records overlapping windows as well. Continue?","Capture warning",MessageBoxButton.YesNo)!=MessageBoxResult.Yes) return;
             StartAudio();
             if(audio==null || audioError!=null) throw new InvalidOperationException("System audio could not start.");
-            var initial=Compose(b,p,f);
+            var initial=ComposePixels(b,p,f);
             var session=new RecordingSession(ffmpegPath.Text,outputFolder.Text,audio.WaveFormat.SampleRate,audio.WaveFormat.Channels,initial);
             Volatile.Write(ref recording,session);
             mode.IsEnabled=false; outputFolder.IsEnabled=false; ffmpegPath.IsEnabled=false;
@@ -315,6 +405,7 @@ internal sealed class CaptureWindow : Window
     }
     private async Task FinishRecord()
     {
+        autoRecord.IsChecked=false;
         var session=Interlocked.Exchange(ref recording,null);
         if(session==null) return;
         finishing=true;
@@ -326,23 +417,38 @@ internal sealed class CaptureWindow : Window
         } catch(Exception ex) { recordingStatus.Text="Recording finalization failed: "+ex.Message+" | Recovery: "+session.WorkFolder; App.Log($"RECORD_ERROR {ex}"); }
         finally { finishing=false; mode.IsEnabled=true; outputFolder.IsEnabled=true; ffmpegPath.IsEnabled=true; }
     }
-    private static byte[] Compose(BitmapSource source,Rect p,Rect f)
+    private static byte[] ComposePixels(BitmapSource source,Rect p,Rect f)
     {
-        var visual=new DrawingVisual();
-        using(var dc=visual.RenderOpen()) {
-            dc.DrawRectangle(Brushes.White,null,new Rect(0,0,1280,720));
-            DrawFit(dc,Crop(source,p)!,new Rect(8,8,952,704));
-            DrawFit(dc,Crop(source,f)!,new Rect(968,432,304,280));
+        // Frozen WPF frame is safe to copy on a worker thread. GDI composition
+        // avoids rendering and allocating WPF visuals at the capture cadence.
+        int w=source.PixelWidth,h=source.PixelHeight;
+        byte[] input=new byte[checked(w*h*4)];
+        source.CopyPixels(input,w*4,0);
+        using var src=new Drawing.Bitmap(w,h,Drawing.Imaging.PixelFormat.Format32bppRgb);
+        var rect=new Drawing.Rectangle(0,0,w,h);
+        var bits=src.LockBits(rect,Drawing.Imaging.ImageLockMode.WriteOnly,Drawing.Imaging.PixelFormat.Format32bppRgb);
+        try { for(int y=0;y<h;y++) Marshal.Copy(input,y*w*4,IntPtr.Add(bits.Scan0,y*bits.Stride),w*4); }
+        finally { src.UnlockBits(bits); }
+        using var dest=new Drawing.Bitmap(1280,720,Drawing.Imaging.PixelFormat.Format32bppRgb);
+        using(var g=Drawing.Graphics.FromImage(dest)) {
+            g.Clear(Drawing.Color.White);
+            g.InterpolationMode=Drawing.Drawing2D.InterpolationMode.Bilinear;
+            Fit(g,src,p,new Drawing.Rectangle(8,8,952,704));
+            Fit(g,src,f,new Drawing.Rectangle(968,432,304,280));
         }
-        var result=new RenderTargetBitmap(1280,720,96,96,PixelFormats.Pbgra32);
-        result.Render(visual);
-        var bytes=new byte[1280*720*4]; result.CopyPixels(bytes,1280*4,0); return bytes;
+        var output=new byte[1280*720*4];
+        var d=dest.LockBits(new Drawing.Rectangle(0,0,1280,720),Drawing.Imaging.ImageLockMode.ReadOnly,Drawing.Imaging.PixelFormat.Format32bppRgb);
+        try { for(int y=0;y<720;y++) Marshal.Copy(IntPtr.Add(d.Scan0,y*d.Stride),output,y*1280*4,1280*4); }
+        finally { dest.UnlockBits(d); }
+        return output;
     }
-    private static void DrawFit(DrawingContext dc,BitmapSource b,Rect area)
+    private static void Fit(Drawing.Graphics g,Drawing.Bitmap b,Rect r,Drawing.Rectangle area)
     {
-        double scale=Math.Min(area.Width/b.PixelWidth,area.Height/b.PixelHeight);
-        double w=b.PixelWidth*scale,h=b.PixelHeight*scale;
-        dc.DrawImage(b,new Rect(area.X+(area.Width-w)/2,area.Y+(area.Height-h)/2,w,h));
+        int x=Math.Clamp((int)(r.X*b.Width),0,b.Width-1),y=Math.Clamp((int)(r.Y*b.Height),0,b.Height-1);
+        int w=Math.Clamp((int)(r.Width*b.Width),1,b.Width-x),h=Math.Clamp((int)(r.Height*b.Height),1,b.Height-y);
+        double scale=Math.Min(area.Width/(double)w,area.Height/(double)h);
+        int dw=Math.Max(1,(int)(w*scale)),dh=Math.Max(1,(int)(h*scale));
+        g.DrawImage(b,new Drawing.Rectangle(area.X+(area.Width-dw)/2,area.Y+(area.Height-dh)/2,dw,dh),new Drawing.Rectangle(x,y,w,h),Drawing.GraphicsUnit.Pixel);
     }
     private void StartAudio()
     {

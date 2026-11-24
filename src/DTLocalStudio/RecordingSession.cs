@@ -6,7 +6,7 @@ namespace DTLocalStudio;
 // then muxed with a wall-clock-aligned PCM stream into MP4.
 internal sealed class RecordingSession
 {
-    private const int Fps=5;
+    private const int Fps=15;
     private readonly object gate=new();
     private readonly Stopwatch active=Stopwatch.StartNew();
     private readonly Process encoder;
@@ -23,7 +23,7 @@ internal sealed class RecordingSession
     public string WorkFolder {get;}
     public bool IsPaused {get {lock(gate) return paused;}}
     public Exception? Failure {get {lock(gate) return failure;}}
-    public string Status {get {lock(gate) return failure!=null?"Recording error: "+failure.Message:$"{(paused?"PAUSED":"RECORDING")} {active.Elapsed:hh\\:mm\\:ss} | 720p / 5 fps | {OutputPath}";}}
+    public string Status {get {lock(gate) return failure!=null?"Recording error: "+failure.Message:$"{(paused?"PAUSED":"RECORDING")} {active.Elapsed:hh\\:mm\\:ss} | 720p / 15 fps | {OutputPath}";}}
     public RecordingSession(string executable,string folder,int rate,int channelCount,byte[] initial)
     {
         if(rate<=0 || channelCount<1 || channelCount>8) throw new ArgumentException("Unsupported audio format.");
@@ -35,7 +35,7 @@ internal sealed class RecordingSession
         videoPath=Path.Combine(WorkFolder,"video.mkv"); audioPath=Path.Combine(WorkFolder,"audio.pcm");
         pcm=new FileStream(audioPath,FileMode.CreateNew,FileAccess.Write,FileShare.Read);
         try {
-            encoder=Start(ffmpeg,["-hide_banner","-loglevel","warning","-nostats","-f","rawvideo","-pixel_format","bgra","-video_size","1280x720","-framerate","5","-i","pipe:0","-an","-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p","-b:v","1500k","-maxrate","1700k","-bufsize","3400k","-g","10","-f","matroska",videoPath],true);
+            encoder=Start(ffmpeg,["-hide_banner","-loglevel","warning","-nostats","-f","rawvideo","-pixel_format","bgra","-video_size","1280x720","-framerate",Fps.ToString(),"-i","pipe:0","-an","-c:v","libx264","-preset","ultrafast","-pix_fmt","yuv420p","-b:v","1500k","-maxrate","1700k","-bufsize","3400k","-g","30","-f","matroska",videoPath],true);
             encoderErrors=encoder.StandardError.ReadToEndAsync();
             videoTask=Task.Run(WriteVideo);
         } catch { pcm.Dispose(); throw; }
@@ -64,7 +64,7 @@ internal sealed class RecordingSession
                 }
                 if(done)break;
                 if(encoder.HasExited)throw new IOException("FFmpeg exited during capture.");
-                await Task.Delay(25);
+                await Task.Delay(10);
             }
             await stream.FlushAsync();
         } catch(Exception e){Fail(e);}
