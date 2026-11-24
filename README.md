@@ -27,3 +27,6 @@ Auto refresh Zoom main windows every 3 seconds. Open Recording Studio once; fram
 
 ## 0.6.0
 Window scan uses a separate worker and all visible top-level Zoom windows, ranks meeting titles/classes and area. Auto-open checkbox is opt-in; automatically opens a likely meeting and arms recording. Layout confirmation still required, as crops are not reliably identified. AUTO_STATE diagnostics show blockers. No real faculty recognition or GPU capture yet. Windows test pending.
+
+## 0.6.1
+Replaces fixed automatic crop presets with experimental luminance-component and temporal-motion pane detection. Looks anywhere within the captured window for a large rectangular content region and smaller separate moving rectangle. Ambiguity or absence of visible gutters/motion blocks automatic recording; no face identity model or Zoom sharing metadata. Three consistent observations required. Automatically armed studio starts after three seconds of valid frames with a stable detected layout and available system audio device; continuous loud speech no longer required. Manual draw/confirm is fallback. Fixed bottom-right is output composition only. No runtime verification yet. Keep Zoom restored in side-by-side sharing view. Do not use with unauthorized sessions.

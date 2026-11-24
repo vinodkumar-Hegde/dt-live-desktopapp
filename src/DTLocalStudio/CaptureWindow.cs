@@ -35,9 +35,15 @@ internal sealed class CaptureWindow : Window
     private WasapiLoopbackCapture? audio;
     private RecordingSession? recording;
     private bool finishing, allowClose;
-    private readonly CheckBox autoRecord = new() { Content="Arm automatic recording", Margin=new Thickness(6), VerticalAlignment=VerticalAlignment.Center };
+    private readonly CheckBox autoRecord = new() { Content="Automatic recording (authorized session)", Margin=new Thickness(6), VerticalAlignment=VerticalAlignment.Center };
     private readonly TextBlock automationInfo = new() { Foreground=Brushes.SteelBlue, TextWrapping=TextWrapping.Wrap };
     private bool confirmedLayout;
+    private readonly PaneDetector paneDetector=new();
+    private PaneDetector.Layout? candidate;
+    private int stableLayouts;
+    private long lastDetect;
+    private bool detectionEnabled=true;
+    private bool manualLayout;
     private readonly bool autoLaunch;
     private string? lastWait;
     private int layoutWidth,layoutHeight;
@@ -64,7 +70,7 @@ internal sealed class CaptureWindow : Window
     public CaptureWindow(long hwnd, int sourcePid, int parent,bool automatic=false)
     {
         source = new IntPtr(hwnd); pid = sourcePid; parentPid = parent; autoLaunch=automatic;
-        Title = "DT Local Studio — Recording Studio 0.6.0";
+        Title = "DT Local Studio — Recording Studio 0.6.1";
         Width = 1320; Height = 880; MinWidth = 900; MinHeight = 680;
         Background = new SolidColorBrush(Color.FromRgb(244,247,251));
         var root = new DockPanel { Margin = new Thickness(18) };
@@ -73,7 +79,7 @@ internal sealed class CaptureWindow : Window
         header.Children.Add(new Image { Source=new BitmapImage(new Uri("pack://application:,,,/Assets/doctutorials_logo.png")), Width=100, Height=73, Margin=new Thickness(0,0,18,0) });
         header.Children.Add(new TextBlock { Text="Recording Studio", FontSize=28, Foreground=Brushes.DarkSlateGray, VerticalAlignment=VerticalAlignment.Center });
         top.Children.Add(header);
-        top.Children.Add(new TextBlock { Text = "Authorized sessions only. Keep Zoom restored. Automatic mode requires a confirmed layout and uses system audio (not Zoom-only). Visible-screen mode includes overlapping windows.", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0,6,0,8) });
+        top.Children.Add(new TextBlock { Text = "Authorized sessions only. Keep Zoom restored. Automatic mode searches for a large presentation and a smaller moving video pane; system audio is not Zoom-only. Visible-screen mode includes overlapping windows.", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0,6,0,8) });
         var controls = new WrapPanel();
         mode.Items.Add("Window render (experimental)"); mode.Items.Add("Visible screen pixels"); mode.SelectedIndex = 0;
         
@@ -83,11 +89,10 @@ internal sealed class CaptureWindow : Window
         AddButton(controls,"Select presentation", () => BeginSelection(0));
         AddButton(controls,"Select faculty", () => BeginSelection(1));
         AddButton(controls,"Confirm layout / live", ConfirmLayout);
-        AddButton(controls,"Reset regions", () => { CancelDrag(); confirmedLayout=false; screenCrop = facultyCrop = null; presentation.Source = faculty.Source = null; DrawBoxes(); });
-        AddButton(controls,"Suggest layout", () => {
+        AddButton(controls,"Reset regions", () => { RestartDetection(); });
+        AddButton(controls,"Detect panes again", () => {
             if (frame.Source is not BitmapSource b) { status.Text = "Start frames first."; return; }
-            screenCrop = new Rect(0.02,0.05,0.72,0.90); facultyCrop = new Rect(0.76,0.65,0.22,0.30);
-            confirmedLayout=false; UpdateRegions(b); DrawBoxes(); BeginSelection(0);
+            RestartDetection();
         });
         AddButton(controls,"Restore saved layout", RestoreLayout);
         AddButton(controls,"Start audio meter", StartAudio);
@@ -106,7 +111,7 @@ internal sealed class CaptureWindow : Window
         AddButton(recordControls,"Resume recording", () => { recording?.Resume(); });
         AddButton(recordControls,"Stop and save MP4", async () => { autoRecord.IsChecked=false; await FinishRecord(); });
         recordControls.Children.Add(autoRecord);
-        autoRecord.Checked += (_,_) => { activeSince=0; StartAudio(); automationInfo.Text="Armed: confirm both regions. Starts after sustained audio and valid frames."; };
+        autoRecord.Checked += (_,_) => { activeSince=0; StartAudio(); automationInfo.Text="Automatic recording armed. Waiting for a stable detected or manually confirmed layout."; };
         autoRecord.Unchecked += (_,_) => { activeSince=0; automationInfo.Text="Automatic start disarmed."; };
         top.Children.Add(recordControls); top.Children.Add(recordingStatus); top.Children.Add(automationInfo);
         var audioRow = new WrapPanel { Margin = new Thickness(0,8,0,8) };
@@ -178,7 +183,7 @@ internal sealed class CaptureWindow : Window
     private void ConfirmLayout()
     {
         if(frame.Source is not BitmapSource b || screenCrop is not Rect p || facultyCrop is not Rect f || Rect.Intersect(p,f).Width>0 && Rect.Intersect(p,f).Height>0) { status.Text="Select two separate, non-overlapping regions first."; return; }
-        CancelDrag(); selecting=false; frozen=false; running=true; confirmedLayout=true;
+        CancelDrag(); selecting=false; frozen=false; running=true; confirmedLayout=true; manualLayout=true; detectionEnabled=false;
         layoutWidth=b.PixelWidth; layoutHeight=b.PixelHeight;
         try {
             Directory.CreateDirectory(Path.GetDirectoryName(ProfilePath)!);
@@ -198,23 +203,30 @@ internal sealed class CaptureWindow : Window
                 return new Rect(a[0],a[1],a[2],a[3]);
             }
             screenCrop=Decode(profile.Presentation); facultyCrop=Decode(profile.Faculty);
-            confirmedLayout=false; UpdateRegions(b); DrawBoxes();
+            confirmedLayout=false; detectionEnabled=false; manualLayout=true; UpdateRegions(b); DrawBoxes();
             status.Text="Saved layout restored. Verify content and confirm before recording.";
         } catch(Exception ex) { status.Text="Layout unavailable: "+ex.Message; }
     }
-    private void SuggestRegions(BitmapSource b)
+    private void RestartDetection()
     {
-        // Layout heuristic only: a shared presentation is normally the largest pane.
-        // Never label an unverified crop as a detected person.
-        if(b.PixelWidth/(double)b.PixelHeight>=1.4) {
-            screenCrop=new Rect(.015,.07,.745,.86);
-            facultyCrop=new Rect(.775,.60,.21,.32);
-        } else {
-            screenCrop=new Rect(.03,.06,.94,.64);
-            facultyCrop=new Rect(.58,.73,.38,.22);
-        }
-        confirmedLayout=false;
-        automationInfo.Text="Suggested regions (not identity detection). Adjust and confirm once.";
+        CancelDrag(); selecting=false; frozen=false; running=true;
+        confirmedLayout=false; manualLayout=false; detectionEnabled=true;
+        screenCrop=facultyCrop=null; presentation.Source=faculty.Source=null;
+        paneDetector.Reset(); candidate=null; stableLayouts=0; activeSince=0;
+        automationInfo.Text="Searching for the presentation and smaller moving video pane…"; DrawBoxes();
+    }
+    private void ApplyDetection(PaneDetector.Layout? layout,BitmapSource b)
+    {
+        if(layout==null){candidate=null;stableLayouts=0;return;}
+        stableLayouts=candidate!=null&&PaneDetector.Similar(candidate,layout)?stableLayouts+1:1;
+        candidate=layout;
+        if(stableLayouts<3)return;
+        screenCrop=layout.Presentation;facultyCrop=layout.Faculty;
+        confirmedLayout=true; layoutWidth=b.PixelWidth;layoutHeight=b.PixelHeight;
+        detectionEnabled=false;
+        automationInfo.Text="Stable video pane and presentation detected.";
+        App.Log($"AUTO_LAYOUT score={layout.Score:F3} presentation={screenCrop} faculty={facultyCrop}");
+        UpdateRegions(b); DrawBoxes();
     }
     private void CancelDrag()
     {
@@ -224,9 +236,7 @@ internal sealed class CaptureWindow : Window
     private void BeginSelection(int type)
     {
         if(frame.Source is not BitmapSource b) { status.Text="Start frames first, then choose a region."; return; }
-        CancelDrag(); confirmedLayout=false; activeRegion=type; selecting=true; frozen=true;
-        if(type==0 && screenCrop==null) screenCrop=new Rect(0.03,0.05,0.72,0.90);
-        if(type==1 && facultyCrop==null) facultyCrop=new Rect(0.76,0.65,0.22,0.30);
+        CancelDrag(); confirmedLayout=false; detectionEnabled=false; manualLayout=true; activeRegion=type; selecting=true; frozen=true;
         UpdateRegions(b); DrawBoxes();
         status.Text="Editing "+(type==0?"presentation":"faculty")+". Drag inside to move; drag bottom-right handle to resize; drag outside to redraw. Click Confirm layout / live when finished.";
     }
@@ -327,12 +337,14 @@ internal sealed class CaptureWindow : Window
             if(confirmedLayout && (layoutWidth!=result.Bitmap.PixelWidth || layoutHeight!=result.Bitmap.PixelHeight)) {
                 confirmedLayout=false; autoRecord.IsChecked=false;
                 if(recording!=null) await FinishRecord();
+                RestartDetection();
                 status.Text="Zoom layout size changed. Confirm regions again.";
             }
-            if(screenCrop==null && facultyCrop==null && !result.Dark) {
-                frame.Source=result.Bitmap;
-                if(File.Exists(ProfilePath)) RestoreLayout();
-                if(screenCrop==null || facultyCrop==null) SuggestRegions(result.Bitmap);
+            if(detectionEnabled && !manualLayout && recording==null && !finishing && !result.Dark && Stopwatch.GetElapsedTime(lastDetect).TotalMilliseconds>=450) {
+                lastDetect=Stopwatch.GetTimestamp();
+                var detected=await Task.Run(()=>paneDetector.Observe(result.Bitmap));
+                if(closed||!running||frozen)return;
+                if(detectionEnabled&&!manualLayout){frame.Source=result.Bitmap;ApplyDetection(detected,result.Bitmap);}
             }
             if (currentRecording!=null && ReferenceEquals(recording,currentRecording) && !currentRecording.IsPaused && !result.Dark && p is Rect pr && f is Rect fr)
                 currentRecording.SetFrame(await Task.Run(()=>ComposePixels(result.Bitmap,pr,fr)));
@@ -343,11 +355,11 @@ internal sealed class CaptureWindow : Window
                 lastUiUpdate=Stopwatch.GetTimestamp(); frame.Source=result.Bitmap; UpdateRegions(result.Bitmap); DrawBoxes();
             }
             if(autoRecord.IsChecked==true && recording==null && !finishing) {
-                string wait=!confirmedLayout?"Waiting for confirmed faculty/presentation layout":result.Dark?"Waiting for nonblank frames":mode.SelectedIndex!=0?"Automatic recording requires window-render mode":audio==null||audioError!=null?"Waiting for audio device":db<=-40?"Waiting for audio activity":"Ready — checking sustained activity";
+                string wait=!confirmedLayout?"Detecting faculty/presentation panes (manual selection available)":result.Dark?"Waiting for nonblank frames":mode.SelectedIndex!=0?"Automatic recording requires window-render mode":audio==null||audioError!=null?"Waiting for audio device":"Ready — checking stable live frames";
                 automationInfo.Text=wait;
                 if(lastWait!=wait){lastWait=wait; App.Log("AUTO_STATE "+wait);}
             }
-            if(autoRecord.IsChecked==true && recording==null && !finishing && confirmedLayout && !result.Dark && mode.SelectedIndex==0 && audio!=null && audioError==null && db> -40) {
+            if(autoRecord.IsChecked==true && recording==null && !finishing && confirmedLayout && !result.Dark && mode.SelectedIndex==0 && audio!=null && audioError==null) {
                 if(activeSince==0) activeSince=Stopwatch.GetTimestamp();
                 if(Stopwatch.GetElapsedTime(activeSince).TotalSeconds>=3) {
                     activeSince=0; StartRecord();
