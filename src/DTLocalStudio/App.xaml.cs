@@ -19,11 +19,12 @@ public partial class App : Application
         try {
             Log($"START version={Assembly.GetExecutingAssembly().GetName().Version} exe={Environment.ProcessPath} runtime={Environment.Version}");
             base.OnStartup(e);
+            if(e.Args.Length==2 && e.Args[0]=="--scan") { WindowScanner.Write(e.Args[1]); Shutdown(0); return; }
             Window window;
             if (e.Args.Length == 4 && e.Args[0] == "--preview")
                 window = new PreviewWindow(long.Parse(e.Args[1], System.Globalization.CultureInfo.InvariantCulture), int.Parse(e.Args[2]), int.Parse(e.Args[3]));
-            else if (e.Args.Length == 4 && e.Args[0] == "--capture")
-                window = new CaptureWindow(long.Parse(e.Args[1], System.Globalization.CultureInfo.InvariantCulture), int.Parse(e.Args[2]), int.Parse(e.Args[3]));
+            else if (e.Args.Length == 4 && (e.Args[0] == "--capture" || e.Args[0]=="--auto-capture"))
+                window = new CaptureWindow(long.Parse(e.Args[1], System.Globalization.CultureInfo.InvariantCulture), int.Parse(e.Args[2]), int.Parse(e.Args[3]),e.Args[0]=="--auto-capture");
             else
                 window = new MainWindow();
             MainWindow = window;

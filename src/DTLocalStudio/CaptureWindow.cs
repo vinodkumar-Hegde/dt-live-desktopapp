@@ -38,6 +38,8 @@ internal sealed class CaptureWindow : Window
     private readonly CheckBox autoRecord = new() { Content="Arm automatic recording", Margin=new Thickness(6), VerticalAlignment=VerticalAlignment.Center };
     private readonly TextBlock automationInfo = new() { Foreground=Brushes.SteelBlue, TextWrapping=TextWrapping.Wrap };
     private bool confirmedLayout;
+    private readonly bool autoLaunch;
+    private string? lastWait;
     private int layoutWidth,layoutHeight;
     private long activeSince,lastGoodFrame,lastUiUpdate,lastParentCheck;
     private bool lastDark=true;
@@ -59,10 +61,10 @@ internal sealed class CaptureWindow : Window
     private int frames;
     private readonly Stopwatch clock = Stopwatch.StartNew();
 
-    public CaptureWindow(long hwnd, int sourcePid, int parent)
+    public CaptureWindow(long hwnd, int sourcePid, int parent,bool automatic=false)
     {
-        source = new IntPtr(hwnd); pid = sourcePid; parentPid = parent;
-        Title = "DT Local Studio — Recording Studio 0.5.0";
+        source = new IntPtr(hwnd); pid = sourcePid; parentPid = parent; autoLaunch=automatic;
+        Title = "DT Local Studio — Recording Studio 0.6.0";
         Width = 1320; Height = 880; MinWidth = 900; MinHeight = 680;
         Background = new SolidColorBrush(Color.FromRgb(244,247,251));
         var root = new DockPanel { Margin = new Thickness(18) };
@@ -161,7 +163,7 @@ internal sealed class CaptureWindow : Window
         };
         overlay.LostMouseCapture += (_,_) => { dragStart=null; originalDrag=null; };
         timer.Tick += Tick;
-        ContentRendered += (_,_) => { running=true; timer.Start(); App.Log("CAPTURE_LAB_READY"); };
+        ContentRendered += (_,_) => { running=true; timer.Start(); if(autoLaunch) autoRecord.IsChecked=true; App.Log("CAPTURE_LAB_READY"); };
         Closing += async (_, e) => {
             if (allowClose || (recording==null && !finishing)) return;
             e.Cancel=true;
@@ -336,6 +338,11 @@ internal sealed class CaptureWindow : Window
             if(captureRate.Elapsed.TotalSeconds>=1) { measuredFps=rateFrames/captureRate.Elapsed.TotalSeconds; rateFrames=0; captureRate.Restart(); }
             if(Stopwatch.GetElapsedTime(lastUiUpdate).TotalMilliseconds>=200) {
                 lastUiUpdate=Stopwatch.GetTimestamp(); frame.Source=result.Bitmap; UpdateRegions(result.Bitmap); DrawBoxes();
+            }
+            if(autoRecord.IsChecked==true && recording==null && !finishing) {
+                string wait=!confirmedLayout?"Waiting for confirmed faculty/presentation layout":result.Dark?"Waiting for nonblank frames":mode.SelectedIndex!=0?"Automatic recording requires window-render mode":audio==null||audioError!=null?"Waiting for audio device":db<=-40?"Waiting for audio activity":"Ready — checking sustained activity";
+                automationInfo.Text=wait;
+                if(lastWait!=wait){lastWait=wait; App.Log("AUTO_STATE "+wait);}
             }
             if(autoRecord.IsChecked==true && recording==null && !finishing && confirmedLayout && !result.Dark && mode.SelectedIndex==0 && audio!=null && audioError==null && db> -40) {
                 if(activeSince==0) activeSince=Stopwatch.GetTimestamp();
