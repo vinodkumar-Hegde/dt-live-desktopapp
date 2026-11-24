@@ -23,7 +23,13 @@ internal sealed class CaptureWindow : Window
     private readonly TextBlock audioText = new() { Text = "System output audio: off" };
     private readonly ProgressBar meter = new() { Minimum = 0, Maximum = 100, Height = 12, Width = 150 };
     private readonly ComboBox mode = new() { Width = 205 };
-    private readonly ComboBox region = new() { Width = 140 };
+    private readonly Canvas overlay = new() { Background = Brushes.Transparent, ClipToBounds = true };
+    private readonly TextBlock selectionInfo = new() { TextWrapping = TextWrapping.Wrap };
+    private int activeRegion;
+    private Rect? originalDrag;
+    private string dragMode = "draw";
+    private bool selecting;
+    private const double MinRegion = 0.025;
     private WasapiLoopbackCapture? audio;
     private double rms;
     private long lastAudio;
@@ -38,7 +44,7 @@ internal sealed class CaptureWindow : Window
     public CaptureWindow(long hwnd, int sourcePid, int parent)
     {
         source = new IntPtr(hwnd); pid = sourcePid; parentPid = parent;
-        Title = "DT Local Studio — Capture lab 0.3.0";
+        Title = "DT Local Studio — Capture lab 0.3.1";
         Width = 1200; Height = 800; MinWidth = 700; MinHeight = 540;
         Background = Brushes.White;
         var root = new DockPanel { Margin = new Thickness(18) };
@@ -47,27 +53,36 @@ internal sealed class CaptureWindow : Window
         top.Children.Add(new TextBlock { Text = "Window capture is experimental. Visible-screen mode captures anything covering Zoom; keep the lab on another monitor or beside Zoom. No recording is saved.", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0,6,0,8) });
         var controls = new WrapPanel();
         mode.Items.Add("Window render (experimental)"); mode.Items.Add("Visible screen pixels"); mode.SelectedIndex = 0;
-        region.Items.Add("Presentation"); region.Items.Add("Faculty"); region.SelectedIndex = 0;
+        
         controls.Children.Add(mode);
-        AddButton(controls,"Start frames", () => { running = true; frozen = false; lastSample = null; frames = 0; status.Text = "Waiting for frames"; });
-        AddButton(controls,"Stop frames", () => { running = false; frozen = false; });
-        AddButton(controls,"Freeze / resume", () => { frozen = !frozen; status.Text = frozen ? "Frozen. Select region type and drag on source image." : "Resumed"; });
-        controls.Children.Add(region);
-        AddButton(controls,"Clear regions", () => { screenCrop = facultyCrop = null; presentation.Source = faculty.Source = null; });
+        AddButton(controls,"Start frames", () => { CancelDrag(); selecting = false; running = true; frozen = false; DrawBoxes(); lastSample = null; frames = 0; status.Text = "Waiting for frames"; });
+        AddButton(controls,"Stop frames", () => { CancelDrag(); selecting = false; running = false; frozen = false; DrawBoxes(); });
+        AddButton(controls,"Select presentation", () => BeginSelection(0));
+        AddButton(controls,"Select faculty", () => BeginSelection(1));
+        AddButton(controls,"Done / live", () => { CancelDrag(); selecting = false; frozen = false; running = true; DrawBoxes(); });
+        AddButton(controls,"Reset regions", () => { CancelDrag(); screenCrop = facultyCrop = null; presentation.Source = faculty.Source = null; DrawBoxes(); });
+        AddButton(controls,"Layout preset", () => {
+            if (frame.Source is not BitmapSource b) { status.Text = "Start frames first."; return; }
+            screenCrop = new Rect(0.02,0.05,0.72,0.90); facultyCrop = new Rect(0.76,0.65,0.22,0.30);
+            UpdateRegions(b); DrawBoxes(); BeginSelection(0);
+        });
         AddButton(controls,"Start audio meter", StartAudio);
         AddButton(controls,"Stop audio", StopAudio);
         top.Children.Add(controls);
         var audioRow = new WrapPanel { Margin = new Thickness(0,8,0,8) };
         audioRow.Children.Add(audioText); audioRow.Children.Add(meter); top.Children.Add(audioRow);
-        top.Children.Add(status);
+        top.Children.Add(status); top.Children.Add(selectionInfo);
         DockPanel.SetDock(top,Dock.Top); root.Children.Add(top);
         var grid = new Grid();
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(2,GridUnitType.Star) });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1,GridUnitType.Star) });
         var left = new DockPanel { Margin = new Thickness(0,0,8,0) };
-        var label = new TextBlock { Text = "Source — freeze and drag to select regions", Margin = new Thickness(0,8,0,8) };
+        var label = new TextBlock { Text = "Source — blue: presentation | green: faculty", Margin = new Thickness(0,8,0,8) };
         DockPanel.SetDock(label,Dock.Top); left.Children.Add(label);
-        left.Children.Add(new Border { Background = Brushes.Black, Child = frame });
+        var sourceGrid = new Grid { ClipToBounds = true, Background = Brushes.Black };
+        sourceGrid.Children.Add(frame); sourceGrid.Children.Add(overlay);
+        left.Children.Add(sourceGrid);
+        overlay.SizeChanged += (_,_) => DrawBoxes();
         grid.Children.Add(left);
         var right = new Grid();
         right.RowDefinitions.Add(new RowDefinition()); right.RowDefinitions.Add(new RowDefinition());
@@ -75,22 +90,86 @@ internal sealed class CaptureWindow : Window
         var c = PanelFor("Faculty region",faculty);
         Grid.SetRow(c,1); right.Children.Add(p); right.Children.Add(c);
         Grid.SetColumn(right,1); grid.Children.Add(right); root.Children.Add(grid); Content = root;
-        frame.MouseLeftButtonDown += (_, e) => {
-            if (!frozen || frame.Source is not BitmapSource b) return;
-            dragStart = ImagePoint(e.GetPosition(frame), b); if (dragStart != null) frame.CaptureMouse();
+        overlay.MouseLeftButtonDown += (_, e) => {
+            if (!selecting || frame.Source is not BitmapSource b) return;
+            var p = ImagePoint(e.GetPosition(overlay),b);
+            if (p is not Point point) return;
+            dragStart = point;
+            originalDrag = activeRegion == 0 ? screenCrop : facultyCrop;
+            dragMode = "draw";
+            if (originalDrag is Rect r) {
+                var pos = e.GetPosition(overlay);
+                var bounds = DisplayRect(r,b);
+                if (Math.Abs(pos.X-bounds.Right)<=18 && Math.Abs(pos.Y-bounds.Bottom)<=18) dragMode="resize";
+                else if (r.Contains(point)) dragMode="move";
+            }
+            overlay.CaptureMouse();
         };
-        frame.MouseLeftButtonUp += (_, e) => {
-            if (dragStart is not Point start || frame.Source is not BitmapSource b) return;
-            dragStart = null; frame.ReleaseMouseCapture();
-            var end = ImagePoint(e.GetPosition(frame), b, true);
-            if (end is not Point ep || Math.Abs(ep.X-start.X)<0.01 || Math.Abs(ep.Y-start.Y)<0.01) return;
-            var rect = new Rect(start,ep);
-            if (region.SelectedIndex == 0) screenCrop = rect; else facultyCrop = rect;
-            UpdateRegions(b); App.Log($"REGION_SELECTED type={region.SelectedIndex}"); status.Text = "Region selected. Resume frames when ready.";
+        overlay.MouseMove += (_,e) => {
+            if (dragStart is not Point start || frame.Source is not BitmapSource b || e.LeftButton != System.Windows.Input.MouseButtonState.Pressed) return;
+            if (ImagePoint(e.GetPosition(overlay),b,true) is not Point p) return;
+            Rect r;
+            if (dragMode=="move" && originalDrag is Rect old)
+                r=new Rect(Math.Clamp(old.X+p.X-start.X,0,1-old.Width),Math.Clamp(old.Y+p.Y-start.Y,0,1-old.Height),old.Width,old.Height);
+            else if (dragMode=="resize" && originalDrag is Rect size)
+                r=new Rect(size.X,size.Y,Math.Clamp(p.X-size.X,Math.Min(MinRegion,1-size.X),1-size.X),Math.Clamp(p.Y-size.Y,Math.Min(MinRegion,1-size.Y),1-size.Y));
+            else r=new Rect(start,p);
+            if(r.Width<MinRegion || r.Height<MinRegion) return;
+            if(activeRegion==0) screenCrop=r; else facultyCrop=r;
+            UpdateRegions(b); DrawBoxes();
         };
+        overlay.MouseLeftButtonUp += (_,_) => {
+            if (dragStart == null) return;
+            CancelDrag();
+            App.Log($"REGION_SELECTED type={activeRegion}");
+            DrawBoxes();
+        };
+        overlay.LostMouseCapture += (_,_) => { dragStart=null; originalDrag=null; };
         timer.Tick += Tick;
         ContentRendered += (_,_) => { timer.Start(); App.Log("CAPTURE_LAB_READY"); };
         Closed += (_,_) => { closed = true; timer.Stop(); StopAudio(); App.Log("CAPTURE_LAB_CLOSED"); };
+    }
+    private void CancelDrag()
+    {
+        dragStart=null; originalDrag=null;
+        if(overlay.IsMouseCaptured) overlay.ReleaseMouseCapture();
+    }
+    private void BeginSelection(int type)
+    {
+        if(frame.Source is not BitmapSource b) { status.Text="Start frames first, then choose a region."; return; }
+        CancelDrag(); activeRegion=type; selecting=true; frozen=true;
+        if(type==0 && screenCrop==null) screenCrop=new Rect(0.03,0.05,0.72,0.90);
+        if(type==1 && facultyCrop==null) facultyCrop=new Rect(0.76,0.65,0.22,0.30);
+        UpdateRegions(b); DrawBoxes();
+        status.Text="Editing "+(type==0?"presentation":"faculty")+". Drag inside to move; drag bottom-right handle to resize; drag outside to redraw. Click Done / live when finished.";
+    }
+    private Rect DisplayRect(Rect r, BitmapSource b)
+    {
+        double scale=Math.Min(overlay.ActualWidth/b.PixelWidth,overlay.ActualHeight/b.PixelHeight);
+        double w=b.PixelWidth*scale,h=b.PixelHeight*scale;
+        return new Rect((overlay.ActualWidth-w)/2+r.X*w,(overlay.ActualHeight-h)/2+r.Y*h,r.Width*w,r.Height*h);
+    }
+    private void DrawBoxes()
+    {
+        overlay.Children.Clear();
+        selectionInfo.Text=$"Presentation: {(screenCrop.HasValue?"selected":"not selected")} | Faculty: {(facultyCrop.HasValue?"selected":"not selected")} | {(selecting?(activeRegion==0?"Editing presentation":"Editing faculty"):"Live / not editing")}";
+        if(frame.Source is not BitmapSource b || overlay.ActualWidth<=0 || overlay.ActualHeight<=0) return;
+        DrawBox(screenCrop, Brushes.DodgerBlue,"Presentation",0,b);
+        DrawBox(facultyCrop, Brushes.LimeGreen,"Faculty",1,b);
+    }
+    private void DrawBox(Rect? region, Brush brush,string title,int type,BitmapSource b)
+    {
+        if(region is not Rect r) return;
+        var d=DisplayRect(r,b);
+        bool active=selecting && activeRegion==type;
+        var border=new System.Windows.Shapes.Rectangle { Width=d.Width, Height=d.Height, Stroke=brush, StrokeThickness=active?3:2, IsHitTestVisible=false };
+        Canvas.SetLeft(border,d.X); Canvas.SetTop(border,d.Y); overlay.Children.Add(border);
+        var label=new TextBlock { Text=title, Background=brush, Foreground=Brushes.Black, Padding=new Thickness(5,2,5,2), IsHitTestVisible=false };
+        Canvas.SetLeft(label,d.X); Canvas.SetTop(label,d.Y); overlay.Children.Add(label);
+        if(active) {
+            var handle=new System.Windows.Shapes.Rectangle { Width=16,Height=16,Fill=brush,Stroke=Brushes.White,StrokeThickness=1,IsHitTestVisible=false };
+            Canvas.SetLeft(handle,d.Right-16); Canvas.SetTop(handle,d.Bottom-16); overlay.Children.Add(handle);
+        }
     }
     private static DockPanel PanelFor(string name, Image image)
     {
@@ -106,10 +185,10 @@ internal sealed class CaptureWindow : Window
     }
     private Point? ImagePoint(Point p, BitmapSource b, bool clamp = false)
     {
-        double scale = Math.Min(frame.ActualWidth/b.PixelWidth,frame.ActualHeight/b.PixelHeight);
+        double scale = Math.Min(overlay.ActualWidth/b.PixelWidth,overlay.ActualHeight/b.PixelHeight);
         if (scale <= 0) return null;
         double w=b.PixelWidth*scale,h=b.PixelHeight*scale;
-        double x=(p.X-(frame.ActualWidth-w)/2)/w,y=(p.Y-(frame.ActualHeight-h)/2)/h;
+        double x=(p.X-(overlay.ActualWidth-w)/2)/w,y=(p.Y-(overlay.ActualHeight-h)/2)/h;
         if (!clamp && (x<0 || x>1 || y<0 || y>1)) return null;
         return new Point(Math.Clamp(x,0,1),Math.Clamp(y,0,1));
     }
@@ -139,7 +218,7 @@ internal sealed class CaptureWindow : Window
             bool visible = mode.SelectedIndex == 1;
             var result = await Task.Run(() => ReadFrame(visible));
             if (closed || !running || frozen) return;
-            frame.Source = result.Bitmap; UpdateRegions(result.Bitmap);
+            frame.Source = result.Bitmap; UpdateRegions(result.Bitmap); DrawBoxes();
             int changed=0;
             if (lastSample != null) for(int i=0;i<result.Sample.Length;i++) if (Math.Abs(result.Sample[i]-lastSample[i])>12) changed++;
             double motion = 100.0*changed/result.Sample.Length;
