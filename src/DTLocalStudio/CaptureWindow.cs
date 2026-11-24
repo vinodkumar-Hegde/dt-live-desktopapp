@@ -76,7 +76,7 @@ internal sealed class CaptureWindow : Window
     public CaptureWindow(long hwnd, int sourcePid, int parent,bool automatic=false)
     {
         source = new IntPtr(hwnd); pid = sourcePid; parentPid = parent; autoLaunch=automatic;
-        Title = "DT Local Studio — Recording Studio 0.6.3";
+        Title = "DT Local Studio — Recording Studio 0.6.4";
         Width = 1320; Height = 880; MinWidth = 900; MinHeight = 680;
         Background = new SolidColorBrush(Color.FromRgb(244,247,251));
         UseLayoutRounding=true; SnapsToDevicePixels=true; FontFamily=new FontFamily("Segoe UI"); FontSize=13;
@@ -521,7 +521,8 @@ internal sealed class CaptureWindow : Window
             audio = a; audioError = null;
             var format = a.WaveFormat;
             bool floating = format.Encoding == WaveFormatEncoding.IeeeFloat || format is WaveFormatExtensible ext && ext.SubFormat == new Guid("00000003-0000-0010-8000-00aa00389b71");
-            if (!(floating && format.BitsPerSample==32) && !(!floating && format.BitsPerSample==16))
+            bool pcm16 = format.Encoding == WaveFormatEncoding.Pcm || format is WaveFormatExtensible pe && pe.SubFormat == new Guid("00000001-0000-0010-8000-00aa00389b71");
+            if (!(floating && format.BitsPerSample==32) && !(pcm16 && format.BitsPerSample==16))
                 throw new NotSupportedException($"Unsupported meter format: {format}");
             a.DataAvailable += (_,e) => {
                 double sum=0; int step=floating?4:2,count=e.BytesRecorded/step;

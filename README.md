@@ -33,3 +33,6 @@ Replaces fixed automatic crop presets with experimental luminance-component and 
 
 ## 0.6.2
 Resolve FFmpeg to an absolute executable before recording, using saved path, application tools, current and persisted Windows PATH, WinGet links and package directories. Validate libx264 and AAC in a bounded background process. Log FFMPEG_READY or FFMPEG_ERROR; automatic recording waits for validation. Detect FFmpeg button retries. Windows runtime verification pending.
+
+## 0.6.4 audio continuity
+Preserve sample order instead of correcting every packet against callback arrival time. A bounded audio queue moves PCM disk writes off the WASAPI callback; substantial gaps (over 250 ms) and recording/pause boundaries are handled separately. Apply 0.85 gain for headroom; AAC 128 kbps. AUDIO_SUMMARY logs packet count, gap/padding durations and input clipping. This reduces a plausible source of crackle, but actual device glitches and long-duration sync still require testing. System output audio remains non-isolated.

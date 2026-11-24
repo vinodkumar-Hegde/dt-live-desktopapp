@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Threading.Channels;
 namespace DTLocalStudio;
 
 // Fixed-rate proof-of-concept recorder: video is encoded as recoverable MKV,
@@ -13,6 +14,11 @@ internal sealed class RecordingSession
     private readonly Task videoTask;
     private readonly Task<string> encoderErrors;
     private readonly FileStream pcm;
+    private readonly Channel<AudioPacket> audioQueue=Channel.CreateBounded<AudioPacket>(new BoundedChannelOptions(256){SingleReader=true,SingleWriter=false,FullMode=BoundedChannelFullMode.Wait});
+    private readonly Task audioTask;
+    private sealed record AudioPacket(byte[] Data,int Frames,long Gap);
+    private long gapFrames,packetCount,clippedSamples;
+    private bool audioBoundary=true;
     private readonly int sampleRate, channels, block;
     private readonly string ffmpeg, videoPath, audioPath;
     private byte[] latest;
@@ -38,6 +44,7 @@ internal sealed class RecordingSession
         try {
             encoder=Start(ffmpeg,["-hide_banner","-loglevel","warning","-nostats","-f","rawvideo","-pixel_format","bgra","-video_size","1280x720","-framerate",Fps.ToString(),"-i","pipe:0","-an","-c:v","libx264","-preset","ultrafast","-pix_fmt","yuv420p","-b:v","1500k","-maxrate","1700k","-bufsize","3400k","-g","30","-f","matroska",videoPath],true);
             encoderErrors=encoder.StandardError.ReadToEndAsync();
+            audioTask=Task.Run(WriteAudio);
             videoTask=Task.Run(WriteVideo);
         } catch { pcm.Dispose(); throw; }
     }
@@ -48,8 +55,8 @@ internal sealed class RecordingSession
         return Process.Start(info)??throw new InvalidOperationException("FFmpeg could not start.");
     }
     public void SetFrame(byte[] bytes){lock(gate){if(!stopped&&!paused)latest=bytes;}}
-    public void Pause(){lock(gate){if(!stopped&&!paused){active.Stop(); paused=true;}}}
-    public void Resume(){lock(gate){if(!stopped&&paused){paused=false;active.Start();}}}
+    public void Pause(){lock(gate){if(!stopped&&!paused){active.Stop(); paused=true; audioBoundary=true;}}}
+    public void Resume(){lock(gate){if(!stopped&&paused){paused=false;audioBoundary=true;active.Start();}}}
     private void Fail(Exception e){lock(gate){failure??=e;active.Stop();stopped=true;} }
     private async Task WriteVideo()
     {
@@ -73,44 +80,69 @@ internal sealed class RecordingSession
     }
     public void Audio(byte[] data,int count,bool floating)
     {
+        // Preserve packet sample order. Callback arrival times jitter and must
+        // not be used to trim or insert samples at every packet boundary.
         lock(gate){
             if(stopped||paused)return;
-            try {
+            try{
                 int step=floating?4:2,n=count/(step*channels);
+                if(n<=0)return;
                 long end=(long)(active.Elapsed.TotalSeconds*sampleRate);
                 long start=Math.Max(0,end-n);
-                if(start>audioFrames) Silence(start-audioFrames);
-                int skip=(int)Math.Min(n,Math.Max(0,audioFrames-start));
-                var bytes=new byte[(n-skip)*block];
+                long delta=start-audioFrames;
+                bool boundary=audioBoundary;
+                // WASAPI loopback may emit no packets during true silence.
+                // Only insert a substantial gap, not normal callback jitter.
+                long gap=delta>sampleRate/4 || boundary&&delta>0?Math.Max(0,delta):0;
+                int skip=boundary?(int)Math.Min(n,Math.Max(0,audioFrames-start)):0;
+                audioBoundary=false;
+                int kept=n-skip;
+                if(kept<=0&&gap==0)return;
+                var bytes=new byte[kept*block];
                 for(int i=skip*channels,j=0;i<n*channels;i++,j+=2){
                     double v=floating?BitConverter.ToSingle(data,i*4):BitConverter.ToInt16(data,i*2)/32768.0;
-                    short x=(short)Math.Clamp(double.IsFinite(v)?v*32768:0,-32768,32767);
+                    if(!double.IsFinite(v))v=0;
+                    if(Math.Abs(v)>=1)clippedSamples++;
+                    short x=(short)Math.Clamp(v*0.85*32768,-32768,32767);
                     bytes[j]=(byte)x;bytes[j+1]=(byte)(x>>8);
                 }
-                pcm.Write(bytes);audioFrames+=n-skip;
+                if(!audioQueue.Writer.TryWrite(new AudioPacket(bytes,kept,gap)))throw new IOException("Audio write queue overflow; recording stopped to avoid silently dropping samples.");
+                audioFrames+=gap+kept;gapFrames+=gap;packetCount++;
             }catch(Exception e){failure??=e;active.Stop();stopped=true;}
         }
     }
-    private void Silence(long frames)
+    private async Task WriteAudio()
+    {
+        try{
+            await foreach(var packet in audioQueue.Reader.ReadAllAsync()){
+                if(packet.Gap>0)await WriteSilence(packet.Gap);
+                if(packet.Data.Length>0)await pcm.WriteAsync(packet.Data);
+            }
+            await pcm.FlushAsync();
+        }catch(Exception e){Fail(e);}
+    }
+    private async Task WriteSilence(long frames)
     {
         byte[] zero=new byte[8192/block*block];
-        while(frames>0){int n=(int)Math.Min(frames,zero.Length/block);pcm.Write(zero,0,n*block);audioFrames+=n;frames-=n;}
+        while(frames>0){int n=(int)Math.Min(frames,zero.Length/block);await pcm.WriteAsync(zero.AsMemory(0,n*block));frames-=n;}
     }
     public async Task<string> FinishAsync()
     {
-        lock(gate){active.Stop();stopped=true;}
+        lock(gate){active.Stop();stopped=true;audioQueue.Writer.TryComplete();}
         try {
             await videoTask.WaitAsync(TimeSpan.FromSeconds(25));
             await encoder.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(25));
             string errors=await encoderErrors;
-            lock(gate){
-                long target=(long)Math.Ceiling(Math.Max(0.2,active.Elapsed.TotalSeconds)*sampleRate);
-                if(audioFrames<target)Silence(target-audioFrames);
-                pcm.Dispose();
-            }
+            await audioTask;
+            long target=(long)Math.Ceiling(Math.Max(1.0/Fps,active.Elapsed.TotalSeconds)*sampleRate);
+            long padding=Math.Max(0,target-audioFrames);
+            if(padding>0)await WriteSilence(padding);
+            await pcm.FlushAsync();
+            pcm.Dispose();
+            App.Log($"AUDIO_SUMMARY packets={packetCount} capturedFrames={audioFrames-gapFrames} insertedGapMs={gapFrames*1000.0/sampleRate:F1} finalPaddingMs={padding*1000.0/sampleRate:F1} inputClippedSamples={clippedSamples} sampleRate={sampleRate} channels={channels}");
             if(encoder.ExitCode!=0 || Failure!=null)throw new IOException($"Video capture failed: {Failure?.Message} {errors}");
             string temp=Path.Combine(WorkFolder,"final.mp4");
-            using var mux=Start(ffmpeg,["-hide_banner","-loglevel","warning","-i",videoPath,"-f","s16le","-ar",sampleRate.ToString(),"-ac",channels.ToString(),"-i",audioPath,"-map","0:v:0","-map","1:a:0","-c:v","copy","-c:a","aac","-b:a","96k","-shortest","-movflags","+faststart",temp],false);
+            using var mux=Start(ffmpeg,["-hide_banner","-loglevel","warning","-i",videoPath,"-f","s16le","-ar",sampleRate.ToString(),"-ac",channels.ToString(),"-i",audioPath,"-map","0:v:0","-map","1:a:0","-c:v","copy","-c:a","aac","-b:a","128k","-shortest","-movflags","+faststart",temp],false);
             var stderr=mux.StandardError.ReadToEndAsync();
             try { await mux.WaitForExitAsync().WaitAsync(TimeSpan.FromMinutes(10)); }
             catch { if(!mux.HasExited)mux.Kill(true);throw; }
@@ -119,7 +151,9 @@ internal sealed class RecordingSession
             try{Directory.Delete(WorkFolder,true);}catch(Exception e){App.Log("Recovery cleanup: "+e.Message);}
             return OutputPath;
         } finally {
-            lock(gate){pcm.Dispose();}
+            audioQueue.Writer.TryComplete();
+            try{await audioTask;}catch{}
+            pcm.Dispose();
             try{if(!encoder.HasExited)encoder.Kill(true);}catch{}
             encoder.Dispose();
         }
