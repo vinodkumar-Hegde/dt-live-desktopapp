@@ -19,7 +19,11 @@ public partial class App : Application
         try {
             Log($"START version={Assembly.GetExecutingAssembly().GetName().Version} exe={Environment.ProcessPath} runtime={Environment.Version}");
             base.OnStartup(e);
-            var window = new MainWindow();
+            Window window;
+            if (e.Args.Length == 4 && e.Args[0] == "--preview")
+                window = new PreviewWindow(long.Parse(e.Args[1], System.Globalization.CultureInfo.InvariantCulture), int.Parse(e.Args[2]), int.Parse(e.Args[3]));
+            else
+                window = new MainWindow();
             MainWindow = window;
             Log("Main window constructed");
             window.Show();

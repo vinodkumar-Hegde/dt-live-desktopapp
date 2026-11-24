@@ -1,16 +1,24 @@
 <Window x:Class="DTLocalStudio.MainWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="DT Local Studio" Width="1000" Height="680" MinWidth="620" MinHeight="420" Background="#F4F6F9" WindowStartupLocation="CenterScreen">
  <Grid Margin="32">
   <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-  <StackPanel Margin="0,0,0,24"><TextBlock Text="DT Local Studio" FontSize="30" Foreground="#202D40"/><TextBlock Text="Windows startup validation • 0.1.0" Foreground="#65758A" Margin="0,8,0,0"/></StackPanel>
+  <StackPanel Margin="0,0,0,24"><TextBlock Text="DT Local Studio" FontSize="30" Foreground="#202D40"/><TextBlock Text="Zoom source preview • 0.2.0" Foreground="#65758A" Margin="0,8,0,0"/></StackPanel>
   <Border Grid.Row="1" Background="White" BorderBrush="#DCE2EB" BorderThickness="1" CornerRadius="8" Padding="24">
-   <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
-    <TextBlock Text="Studio foundation" FontSize="24" HorizontalAlignment="Center" Foreground="#202D40"/>
-    <TextBlock x:Name="Status" Text="Waiting for first render" Margin="0,12" HorizontalAlignment="Center"/>
-    <TextBlock Text="Recording services are intentionally not loaded in this build." TextWrapping="Wrap" MaxWidth="390" TextAlignment="Center" Foreground="#65758A"/>
-    <Button Content="Test UI responsiveness" Padding="16,10" Margin="0,24,0,0" Click="TestClick"/>
-    <Button Content="Open startup log folder" Padding="16,10" Margin="0,8,0,0" Click="OpenLogs"/>
-   </StackPanel>
+   <Grid>
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <TextBlock Text="Zoom sources" FontSize="22" Foreground="#202D40"/>
+    <TextBlock Grid.Row="1" Text="Join a Zoom session, keep the meeting window open, then scan. Preview opens in a separate process." TextWrapping="Wrap" Margin="0,12"/>
+    <ListBox Grid.Row="2" x:Name="Sources" DisplayMemberPath="Label" MinHeight="60"/>
+    <WrapPanel Grid.Row="3" Margin="0,16,0,0">
+     <Button Content="Scan Zoom" Padding="16,10" Click="ScanClick" Margin="0,0,8,8"/>
+     <Button Content="Open live preview" Padding="16,10" Click="PreviewClick" Margin="0,0,8,8"/>
+     <Button Content="Close preview" Padding="16,10" Click="StopClick" Margin="0,0,8,8"/>
+    </WrapPanel>
+    <TextBlock Grid.Row="4" x:Name="Status" Text="Waiting for first render" TextWrapping="Wrap" Margin="0,8,0,0"/>
+   </Grid>
   </Border>
-  <TextBlock Grid.Row="2" Margin="0,20,0,0" Foreground="#65758A" Text="Local operation • No capture dependencies loaded"/>
+  <WrapPanel Grid.Row="2" Margin="0,16,0,0">
+    <Button Content="Test UI responsiveness" Padding="12,8" Click="TestClick" Margin="0,0,8,0"/>
+    <Button Content="Open startup logs" Padding="12,8" Click="OpenLogs"/>
+  </WrapPanel>
  </Grid>
 </Window>
