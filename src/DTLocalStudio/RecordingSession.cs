@@ -27,6 +27,7 @@ internal sealed class RecordingSession
     public RecordingSession(string executable,string folder,int rate,int channelCount,byte[] initial)
     {
         if(rate<=0 || channelCount<1 || channelCount>8) throw new ArgumentException("Unsupported audio format.");
+        if(!Path.IsPathFullyQualified(executable)||!File.Exists(executable))throw new FileNotFoundException("Validated FFmpeg executable is missing.",executable);
         ffmpeg=executable; sampleRate=rate; channels=channelCount; block=channels*2; latest=initial;
         Directory.CreateDirectory(folder);
         string name="Session_"+DateTime.Now.ToString("yyyyMMdd_HHmmss")+"_"+Guid.NewGuid().ToString("N")[..6];

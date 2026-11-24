@@ -35,6 +35,9 @@ internal sealed class CaptureWindow : Window
     private WasapiLoopbackCapture? audio;
     private RecordingSession? recording;
     private bool finishing, allowClose;
+    private bool encoderChecking;
+    private string? resolvedEncoder;
+    private string? encoderFailure;
     private readonly CheckBox autoRecord = new() { Content="Automatic recording (authorized session)", Margin=new Thickness(6), VerticalAlignment=VerticalAlignment.Center };
     private readonly TextBlock automationInfo = new() { Foreground=Brushes.SteelBlue, TextWrapping=TextWrapping.Wrap };
     private bool confirmedLayout;
@@ -70,7 +73,7 @@ internal sealed class CaptureWindow : Window
     public CaptureWindow(long hwnd, int sourcePid, int parent,bool automatic=false)
     {
         source = new IntPtr(hwnd); pid = sourcePid; parentPid = parent; autoLaunch=automatic;
-        Title = "DT Local Studio — Recording Studio 0.6.1";
+        Title = "DT Local Studio — Recording Studio 0.6.2";
         Width = 1320; Height = 880; MinWidth = 900; MinHeight = 680;
         Background = new SolidColorBrush(Color.FromRgb(244,247,251));
         var root = new DockPanel { Margin = new Thickness(18) };
@@ -103,7 +106,8 @@ internal sealed class CaptureWindow : Window
         AddButton(storage,"Browse folder", () => { var d=new Microsoft.Win32.OpenFolderDialog { Title="Choose recording folder" }; if(d.ShowDialog(this)==true) outputFolder.Text=d.FolderName; });
         AddButton(storage,"Open folder", () => { try { Directory.CreateDirectory(outputFolder.Text); Process.Start(new ProcessStartInfo(outputFolder.Text) { UseShellExecute=true }); } catch(Exception ex) { recordingStatus.Text=ex.Message; } });
         storage.Children.Add(new TextBlock { Text="FFmpeg: ", VerticalAlignment=VerticalAlignment.Center }); storage.Children.Add(ffmpegPath);
-        AddButton(storage,"Choose FFmpeg", () => { var d=new Microsoft.Win32.OpenFileDialog { Filter="FFmpeg executable|ffmpeg.exe|Executables|*.exe" }; if(d.ShowDialog(this)==true) ffmpegPath.Text=d.FileName; });
+        AddButton(storage,"Choose FFmpeg", async () => { var d=new Microsoft.Win32.OpenFileDialog { Filter="FFmpeg executable|ffmpeg.exe|Executables|*.exe" }; if(d.ShowDialog(this)==true) { ffmpegPath.Text=d.FileName; await CheckEncoder(); } });
+        AddButton(storage,"Detect FFmpeg", async () => await CheckEncoder());
         top.Children.Add(storage);
         var recordControls = new WrapPanel();
         AddButton(recordControls,"Start recording", StartRecord);
@@ -171,7 +175,7 @@ internal sealed class CaptureWindow : Window
         };
         overlay.LostMouseCapture += (_,_) => { dragStart=null; originalDrag=null; };
         timer.Tick += Tick;
-        ContentRendered += (_,_) => { running=true; timer.Start(); if(autoLaunch) autoRecord.IsChecked=true; App.Log("CAPTURE_LAB_READY"); };
+        ContentRendered += (_,_) => { running=true; timer.Start(); if(autoLaunch) autoRecord.IsChecked=true; App.Log("CAPTURE_LAB_READY"); _=CheckEncoder(); };
         Closing += async (_, e) => {
             if (allowClose || (recording==null && !finishing)) return;
             e.Cancel=true;
@@ -355,15 +359,15 @@ internal sealed class CaptureWindow : Window
                 lastUiUpdate=Stopwatch.GetTimestamp(); frame.Source=result.Bitmap; UpdateRegions(result.Bitmap); DrawBoxes();
             }
             if(autoRecord.IsChecked==true && recording==null && !finishing) {
-                string wait=!confirmedLayout?"Detecting faculty/presentation panes (manual selection available)":result.Dark?"Waiting for nonblank frames":mode.SelectedIndex!=0?"Automatic recording requires window-render mode":audio==null||audioError!=null?"Waiting for audio device":"Ready — checking stable live frames";
+                string wait=encoderChecking?"Checking FFmpeg encoder":resolvedEncoder==null?(encoderFailure??"Waiting for FFmpeg validation"):!confirmedLayout?"Detecting faculty/presentation panes (manual selection available)":result.Dark?"Waiting for nonblank frames":mode.SelectedIndex!=0?"Automatic recording requires window-render mode":audio==null||audioError!=null?"Waiting for audio device":"Ready — checking stable live frames";
                 automationInfo.Text=wait;
                 if(lastWait!=wait){lastWait=wait; App.Log("AUTO_STATE "+wait);}
             }
-            if(autoRecord.IsChecked==true && recording==null && !finishing && confirmedLayout && !result.Dark && mode.SelectedIndex==0 && audio!=null && audioError==null) {
+            if(autoRecord.IsChecked==true && recording==null && !finishing && resolvedEncoder!=null && !encoderChecking && confirmedLayout && !result.Dark && mode.SelectedIndex==0 && audio!=null && audioError==null) {
                 if(activeSince==0) activeSince=Stopwatch.GetTimestamp();
                 if(Stopwatch.GetElapsedTime(activeSince).TotalSeconds>=3) {
                     activeSince=0; StartRecord();
-                    if(recording==null) autoRecord.IsChecked=false;
+                    if(recording==null && !encoderChecking) autoRecord.IsChecked=false;
                 }
             } else activeSince=0;
             int changed=0;
@@ -408,9 +412,29 @@ internal sealed class CaptureWindow : Window
         }
         return new FrameResult(b,sample,dark>sample.Length*0.98);
     }
-    private void StartRecord()
+    private async Task CheckEncoder()
     {
-        if(recording!=null || finishing) return;
+        if(encoderChecking||recording!=null||finishing||closed)return;
+        encoderChecking=true;resolvedEncoder=null;encoderFailure=null;
+        recordingStatus.Text="Checking installed FFmpeg…";
+        try {
+            string requested=ffmpegPath.Text;
+            var path=await Task.Run(()=>FfmpegLocator.ResolveAsync(requested));
+            if(closed)return;
+            resolvedEncoder=path;ffmpegPath.Text=path;recordingStatus.Text="FFmpeg ready";
+        } catch(Exception ex) {
+            encoderFailure=ex.Message;
+            if(!closed)recordingStatus.Text=ex.Message;
+            App.Log("FFMPEG_ERROR "+ex);
+        } finally {encoderChecking=false;}
+    }
+    private async void StartRecord()
+    {
+        if(recording!=null || finishing || encoderChecking) return;
+        if(resolvedEncoder==null || !string.Equals(resolvedEncoder,ffmpegPath.Text,StringComparison.OrdinalIgnoreCase)) {
+            await CheckEncoder();
+            if(closed||resolvedEncoder==null||recording!=null||finishing)return;
+        }
         if(frame.Source is not BitmapSource b || screenCrop is not Rect p || facultyCrop is not Rect f || !running || frozen || !confirmedLayout || lastDark || lastGoodFrame==0 || Stopwatch.GetElapsedTime(lastGoodFrame).TotalSeconds>2) { recordingStatus.Text="Wait for valid live frames and confirm both regions first."; return; }
         try {
             if(!System.IO.Path.IsPathFullyQualified(outputFolder.Text)) throw new InvalidOperationException("Choose an absolute output folder.");
@@ -418,7 +442,7 @@ internal sealed class CaptureWindow : Window
             StartAudio();
             if(audio==null || audioError!=null) throw new InvalidOperationException("System audio could not start.");
             var initial=ComposePixels(b,p,f);
-            var session=new RecordingSession(ffmpegPath.Text,outputFolder.Text,audio.WaveFormat.SampleRate,audio.WaveFormat.Channels,initial);
+            var session=new RecordingSession(resolvedEncoder!,outputFolder.Text,audio.WaveFormat.SampleRate,audio.WaveFormat.Channels,initial);
             Volatile.Write(ref recording,session);
             mode.IsEnabled=false; outputFolder.IsEnabled=false; ffmpegPath.IsEnabled=false;
             recordingStatus.Text=session.Status;

@@ -30,3 +30,6 @@ Window scan uses a separate worker and all visible top-level Zoom windows, ranks
 
 ## 0.6.1
 Replaces fixed automatic crop presets with experimental luminance-component and temporal-motion pane detection. Looks anywhere within the captured window for a large rectangular content region and smaller separate moving rectangle. Ambiguity or absence of visible gutters/motion blocks automatic recording; no face identity model or Zoom sharing metadata. Three consistent observations required. Automatically armed studio starts after three seconds of valid frames with a stable detected layout and available system audio device; continuous loud speech no longer required. Manual draw/confirm is fallback. Fixed bottom-right is output composition only. No runtime verification yet. Keep Zoom restored in side-by-side sharing view. Do not use with unauthorized sessions.
+
+## 0.6.2
+Resolve FFmpeg to an absolute executable before recording, using saved path, application tools, current and persisted Windows PATH, WinGet links and package directories. Validate libx264 and AAC in a bounded background process. Log FFMPEG_READY or FFMPEG_ERROR; automatic recording waits for validation. Detect FFmpeg button retries. Windows runtime verification pending.
