@@ -22,6 +22,8 @@ public partial class App : Application
             Window window;
             if (e.Args.Length == 4 && e.Args[0] == "--preview")
                 window = new PreviewWindow(long.Parse(e.Args[1], System.Globalization.CultureInfo.InvariantCulture), int.Parse(e.Args[2]), int.Parse(e.Args[3]));
+            else if (e.Args.Length == 4 && e.Args[0] == "--capture")
+                window = new CaptureWindow(long.Parse(e.Args[1], System.Globalization.CultureInfo.InvariantCulture), int.Parse(e.Args[2]), int.Parse(e.Args[3]));
             else
                 window = new MainWindow();
             MainWindow = window;

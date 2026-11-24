@@ -46,7 +46,7 @@ public partial class MainWindow : Window
             using var p = Process.GetProcessById(s.Pid);
             if (p.MainWindowHandle.ToInt64() != s.Handle) { Status.Text = "Source changed. Scan again."; return; }
             var info = new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = false };
-            info.ArgumentList.Add("--preview");
+            info.ArgumentList.Add(sender is System.Windows.Controls.Button { Tag: "capture" } ? "--capture" : "--preview");
             info.ArgumentList.Add(s.Handle.ToString(System.Globalization.CultureInfo.InvariantCulture));
             info.ArgumentList.Add(s.Pid.ToString());
             info.ArgumentList.Add(Environment.ProcessId.ToString());

@@ -1,4 +1,4 @@
-# DT Local Studio 0.2.0
+# DT Local Studio 0.3.0
 Windows WPF application. Version 0.1.0 startup and UI response were verified on the target Windows PC. Version 0.2.0 adds on-demand Zoom main-window scanning and a separate DWM preview process. Build and live preview of this revision require Windows verification.
 
 ## Build
@@ -15,3 +15,6 @@ Expected milestones: FIRST_RENDER, UI_RESPONSE, ZOOM_SCAN, PREVIEW_REQUEST, PREV
 
 ## Limitations
 DWM preview is display-only, not access to raw video frames. One main window per Zoom-prefixed process; some meeting/share windows may not be listed. Minimized, protected or GPU-rendered windows may appear blank or stale. Keep Zoom restored. No audio capture, cropping, recording, background removal or composition yet. No OBS or Zoom SDK dependency. Native preview calls occur in the worker only; scan uses managed Process APIs. Windows Graphics Capture and audio/encoding are later milestones. Only capture authorized meetings.
+
+## 0.3.0 capture lab
+Close all studio processes before publishing. Scan Zoom and select a source, then click Capture lab. Start frames; window rendering is experimental and may return black or stale frames. Visible screen mode captures actual visible pixels, including overlapping windows; move lab aside and keep Zoom restored. Freeze, select Presentation or Faculty, drag over the source, then resume. Start audio meter to monitor default system output (not isolated Zoom audio); no files are saved. Frame counts and sampled motion are diagnostic, not proof of reliable video or faculty detection. Target 5 preview frames/sec, not production recording. Worker errors are isolated; reopen manually after source changes. Build and runtime verification on Windows pending. Production Windows Graphics Capture, process-only audio, recording and automation remain unimplemented.
