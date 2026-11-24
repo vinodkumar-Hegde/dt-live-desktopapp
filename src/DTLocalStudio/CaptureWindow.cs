@@ -69,7 +69,10 @@ internal sealed class CaptureWindow : Window
         Background = new SolidColorBrush(Color.FromRgb(244,247,251));
         var root = new DockPanel { Margin = new Thickness(18) };
         var top = new StackPanel();
-        top.Children.Add(new TextBlock { Text = "Recording Studio", FontSize = 28, Foreground = Brushes.DarkSlateGray });
+        var header = new StackPanel { Orientation=Orientation.Horizontal };
+        header.Children.Add(new Image { Source=new BitmapImage(new Uri("pack://application:,,,/Assets/doctutorials_logo.png")), Width=100, Height=73, Margin=new Thickness(0,0,18,0) });
+        header.Children.Add(new TextBlock { Text="Recording Studio", FontSize=28, Foreground=Brushes.DarkSlateGray, VerticalAlignment=VerticalAlignment.Center });
+        top.Children.Add(header);
         top.Children.Add(new TextBlock { Text = "Authorized sessions only. Keep Zoom restored. Automatic mode requires a confirmed layout and uses system audio (not Zoom-only). Visible-screen mode includes overlapping windows.", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0,6,0,8) });
         var controls = new WrapPanel();
         mode.Items.Add("Window render (experimental)"); mode.Items.Add("Visible screen pixels"); mode.SelectedIndex = 0;
