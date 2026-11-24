@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
@@ -31,6 +32,11 @@ internal sealed class CaptureWindow : Window
     private bool selecting;
     private const double MinRegion = 0.025;
     private WasapiLoopbackCapture? audio;
+    private RecordingSession? recording;
+    private bool finishing, allowClose;
+    private readonly TextBlock recordingStatus = new() { TextWrapping = TextWrapping.Wrap, Foreground = Brushes.DarkRed };
+    private readonly TextBox outputFolder = new() { Width = 380, Text = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos),"DTLocalStudio") };
+    private readonly TextBox ffmpegPath = new() { Width = 220, Text = "ffmpeg.exe" };
     private double rms;
     private long lastAudio;
     private volatile string? audioError;
@@ -44,13 +50,13 @@ internal sealed class CaptureWindow : Window
     public CaptureWindow(long hwnd, int sourcePid, int parent)
     {
         source = new IntPtr(hwnd); pid = sourcePid; parentPid = parent;
-        Title = "DT Local Studio — Capture lab 0.3.1";
+        Title = "DT Local Studio — Capture lab 0.4.0";
         Width = 1200; Height = 800; MinWidth = 700; MinHeight = 540;
         Background = Brushes.White;
         var root = new DockPanel { Margin = new Thickness(18) };
         var top = new StackPanel();
         top.Children.Add(new TextBlock { Text = "Capture lab", FontSize = 24 });
-        top.Children.Add(new TextBlock { Text = "Window capture is experimental. Visible-screen mode captures anything covering Zoom; keep the lab on another monitor or beside Zoom. No recording is saved.", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0,6,0,8) });
+        top.Children.Add(new TextBlock { Text = "Window capture is experimental. Visible-screen mode captures anything covering Zoom; keep the lab on another monitor or beside Zoom. Record only authorized sessions. System audio includes other applications.", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0,6,0,8) });
         var controls = new WrapPanel();
         mode.Items.Add("Window render (experimental)"); mode.Items.Add("Visible screen pixels"); mode.SelectedIndex = 0;
         
@@ -69,6 +75,19 @@ internal sealed class CaptureWindow : Window
         AddButton(controls,"Start audio meter", StartAudio);
         AddButton(controls,"Stop audio", StopAudio);
         top.Children.Add(controls);
+        var storage = new WrapPanel { Margin = new Thickness(0,4,0,4) };
+        storage.Children.Add(new TextBlock { Text="Output folder: ", VerticalAlignment=VerticalAlignment.Center }); storage.Children.Add(outputFolder);
+        AddButton(storage,"Browse folder", () => { var d=new Microsoft.Win32.OpenFolderDialog { Title="Choose recording folder" }; if(d.ShowDialog(this)==true) outputFolder.Text=d.FolderName; });
+        AddButton(storage,"Open folder", () => { try { Directory.CreateDirectory(outputFolder.Text); Process.Start(new ProcessStartInfo(outputFolder.Text) { UseShellExecute=true }); } catch(Exception ex) { recordingStatus.Text=ex.Message; } });
+        storage.Children.Add(new TextBlock { Text="FFmpeg: ", VerticalAlignment=VerticalAlignment.Center }); storage.Children.Add(ffmpegPath);
+        AddButton(storage,"Choose FFmpeg", () => { var d=new Microsoft.Win32.OpenFileDialog { Filter="FFmpeg executable|ffmpeg.exe|Executables|*.exe" }; if(d.ShowDialog(this)==true) ffmpegPath.Text=d.FileName; });
+        top.Children.Add(storage);
+        var recordControls = new WrapPanel();
+        AddButton(recordControls,"Start recording", StartRecord);
+        AddButton(recordControls,"Pause recording", () => { recording?.Pause(); });
+        AddButton(recordControls,"Resume recording", () => { recording?.Resume(); });
+        AddButton(recordControls,"Stop and save MP4", async () => await FinishRecord());
+        top.Children.Add(recordControls); top.Children.Add(recordingStatus);
         var audioRow = new WrapPanel { Margin = new Thickness(0,8,0,8) };
         audioRow.Children.Add(audioText); audioRow.Children.Add(meter); top.Children.Add(audioRow);
         top.Children.Add(status); top.Children.Add(selectionInfo);
@@ -127,6 +146,12 @@ internal sealed class CaptureWindow : Window
         overlay.LostMouseCapture += (_,_) => { dragStart=null; originalDrag=null; };
         timer.Tick += Tick;
         ContentRendered += (_,_) => { timer.Start(); App.Log("CAPTURE_LAB_READY"); };
+        Closing += async (_, e) => {
+            if (allowClose || (recording==null && !finishing)) return;
+            e.Cancel=true;
+            if(finishing) return;
+            await FinishRecord(); allowClose=true; Close();
+        };
         Closed += (_,_) => { closed = true; timer.Stop(); StopAudio(); App.Log("CAPTURE_LAB_CLOSED"); };
     }
     private void CancelDrag()
@@ -178,10 +203,14 @@ internal sealed class CaptureWindow : Window
         DockPanel.SetDock(text,Dock.Top); panel.Children.Add(text);
         panel.Children.Add(new Border { Background = Brushes.WhiteSmoke, Child = image }); return panel;
     }
-    private static void AddButton(Panel panel,string title,Action action)
+    private void AddButton(Panel panel,string title,Action action)
     {
         var b = new Button { Content = title, Padding = new Thickness(9,5,9,5), Margin = new Thickness(3) };
-        b.Click += (_,_) => action(); panel.Children.Add(b);
+        b.Click += (_,_) => {
+            if (finishing) return;
+            if (recording!=null && title is not ("Pause recording" or "Resume recording" or "Stop and save MP4" or "Open folder")) { recordingStatus.Text="Stop recording before changing capture or storage settings."; return; }
+            action();
+        }; panel.Children.Add(b);
     }
     private Point? ImagePoint(Point p, BitmapSource b, bool clamp = false)
     {
@@ -212,6 +241,10 @@ internal sealed class CaptureWindow : Window
         double db = 20*Math.Log10(Math.Max(level,0.000001));
         meter.Value = Math.Clamp((db+60)*100/60,0,100);
         if (audio != null) audioText.Text = audioError ?? $"System output (not Zoom-only): {db:F1} dBFS | {(db > -45 ? "active" : "quiet")} ";
+        if (recording is RecordingSession rec) {
+            recordingStatus.Text=rec.Status;
+            if(rec.Failure!=null || audioError!=null) { await FinishRecord(); return; }
+        }
         if (!running || frozen || busy) return;
         busy = true;
         try {
@@ -219,13 +252,15 @@ internal sealed class CaptureWindow : Window
             var result = await Task.Run(() => ReadFrame(visible));
             if (closed || !running || frozen) return;
             frame.Source = result.Bitmap; UpdateRegions(result.Bitmap); DrawBoxes();
+            if (recording is RecordingSession current && !current.IsPaused)
+                current.SetFrame(Compose(result.Bitmap,screenCrop!.Value,facultyCrop!.Value));
             int changed=0;
             if (lastSample != null) for(int i=0;i<result.Sample.Length;i++) if (Math.Abs(result.Sample[i]-lastSample[i])>12) changed++;
             double motion = 100.0*changed/result.Sample.Length;
             lastSample = result.Sample; frames++;
             status.Text = $"Frames: {frames} | {result.Bitmap.PixelWidth} × {result.Bitmap.PixelHeight} | motion {motion:F1}% | {(result.Dark ? "Dark/blank candidate — try alternate mode" : "Frame received")} | {clock.Elapsed:hh\\:mm\\:ss}";
             if (frames==1 || frames%50==0) App.Log($"FRAME_RECEIVED count={frames} dark={result.Dark} motion={motion:F1}");
-        } catch(Exception ex) { running=false; status.Text=$"Capture stopped: {ex.Message}. Restore Zoom or rescan."; App.Log($"CAPTURE_ERROR {ex}"); }
+        } catch(Exception ex) { running=false; status.Text=$"Capture stopped: {ex.Message}. Restore Zoom or rescan."; App.Log($"CAPTURE_ERROR {ex}"); if(recording!=null) await FinishRecord(); }
         finally { busy=false; }
     }
     private sealed record FrameResult(BitmapSource Bitmap,byte[] Sample,bool Dark);
@@ -261,6 +296,54 @@ internal sealed class CaptureWindow : Window
         }
         return new FrameResult(b,sample,dark>sample.Length*0.98);
     }
+    private void StartRecord()
+    {
+        if(recording!=null || finishing) return;
+        if(frame.Source is not BitmapSource b || screenCrop is not Rect p || facultyCrop is not Rect f || !running || frozen) { recordingStatus.Text="Start frames, select both regions and click Done / live first."; return; }
+        try {
+            if(!System.IO.Path.IsPathFullyQualified(outputFolder.Text)) throw new InvalidOperationException("Choose an absolute output folder.");
+            if(mode.SelectedIndex==1 && MessageBox.Show("Visible-screen mode records overlapping windows as well. Continue?","Capture warning",MessageBoxButton.YesNo)!=MessageBoxResult.Yes) return;
+            StartAudio();
+            if(audio==null || audioError!=null) throw new InvalidOperationException("System audio could not start.");
+            var initial=Compose(b,p,f);
+            var session=new RecordingSession(ffmpegPath.Text,outputFolder.Text,audio.WaveFormat.SampleRate,audio.WaveFormat.Channels,initial);
+            Volatile.Write(ref recording,session);
+            mode.IsEnabled=false; outputFolder.IsEnabled=false; ffmpegPath.IsEnabled=false;
+            recordingStatus.Text=session.Status;
+            App.Log("RECORD_STARTED "+session.OutputPath);
+        } catch(Exception ex) { recordingStatus.Text=ex.Message; App.Log($"RECORD_ERROR {ex}"); }
+    }
+    private async Task FinishRecord()
+    {
+        var session=Interlocked.Exchange(ref recording,null);
+        if(session==null) return;
+        finishing=true;
+        recordingStatus.Text="Finalizing MP4 — do not close the app.";
+        try {
+            var path=await session.FinishAsync();
+            recordingStatus.Text="Saved: "+path;
+            App.Log("RECORD_SAVED "+path);
+        } catch(Exception ex) { recordingStatus.Text="Recording finalization failed: "+ex.Message+" | Recovery: "+session.WorkFolder; App.Log($"RECORD_ERROR {ex}"); }
+        finally { finishing=false; mode.IsEnabled=true; outputFolder.IsEnabled=true; ffmpegPath.IsEnabled=true; }
+    }
+    private static byte[] Compose(BitmapSource source,Rect p,Rect f)
+    {
+        var visual=new DrawingVisual();
+        using(var dc=visual.RenderOpen()) {
+            dc.DrawRectangle(Brushes.White,null,new Rect(0,0,1280,720));
+            DrawFit(dc,Crop(source,p)!,new Rect(8,8,952,704));
+            DrawFit(dc,Crop(source,f)!,new Rect(968,432,304,280));
+        }
+        var result=new RenderTargetBitmap(1280,720,96,96,PixelFormats.Pbgra32);
+        result.Render(visual);
+        var bytes=new byte[1280*720*4]; result.CopyPixels(bytes,1280*4,0); return bytes;
+    }
+    private static void DrawFit(DrawingContext dc,BitmapSource b,Rect area)
+    {
+        double scale=Math.Min(area.Width/b.PixelWidth,area.Height/b.PixelHeight);
+        double w=b.PixelWidth*scale,h=b.PixelHeight*scale;
+        dc.DrawImage(b,new Rect(area.X+(area.Width-w)/2,area.Y+(area.Height-h)/2,w,h));
+    }
     private void StartAudio()
     {
         if (audio != null) return;
@@ -277,6 +360,8 @@ internal sealed class CaptureWindow : Window
                     double s=floating?BitConverter.ToSingle(e.Buffer,i):BitConverter.ToInt16(e.Buffer,i)/32768.0;
                     if(double.IsFinite(s)) sum+=s*s;
                 }
+                var active = Volatile.Read(ref recording);
+                if(active!=null) active.Audio(e.Buffer,e.BytesRecorded,floating);
                 Volatile.Write(ref rms,Math.Sqrt(sum/Math.Max(1,count))); Interlocked.Exchange(ref lastAudio,Stopwatch.GetTimestamp());
             };
             a.RecordingStopped += (_,e) => { if(e.Exception!=null) { audioError=e.Exception.Message; App.Log($"AUDIO_ERROR {e.Exception}"); } };
